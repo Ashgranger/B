@@ -71,6 +71,17 @@ class ConditionalMarkoutModel:
         w = Decimal(str(n)) / (Decimal(str(n)) + Decimal(str(self.prior_weight)))
         return w * sample_mean + (Decimal("1") - w) * prior
 
+MODULE_PARAMS: dict[str, set[str]] = {
+    'inventory': {'skew_bps', 'gamma_risk_aversion', 'exit_min_profit_bps', 'stress_loss_bps', 'max_hold_s'},
+    'execution': {'requote_bps', 'retreat_bps', 'min_requote_s'},
+    'pricing': {'min_edge_bps', 'max_edge_bps', 'vol_k', 'tox_mult', 'min_ev_bps'},
+    'orderbook_intel': {'obi_alpha', 'tfi_beta', 'fill_prob_kappa'},
+    'ladder': {'extra_levels', 'level_spacing_bps', 'level_size_mult'},
+    'regimes': {'regime_vol_threshold_bps', 'regime_flow_threshold', 'regime_toxic_threshold_bps', 'regime_toxic_spread_mult'},
+    'guards': {'trend_pull_bps', 'trend_widen', 'burst_fills', 'burst_cooldown_s', 'sweep_guard_fills'},
+    'cross_exchange': {'cross_lead_lag_weight', 'cross_dispersion_widen_mult', 'cross_velocity_threshold_bps'}
+}
+
 class OnlineLearner:
     """Level 7+ Autonomous Online Learning Engine.
     Dynamically modulates ALL market making environment parameters, microstructural
@@ -80,6 +91,8 @@ class OnlineLearner:
         self.cfg = cfg
         self.enabled = bool(getattr(cfg, "enable_online_learning", False))
         self.state_path = getattr(cfg, "learning_state_path", "learning_state.json")
+        self.disabled_modules = set(getattr(cfg, 'learner_disabled_modules', set()))
+        self.disabled_params = set(getattr(cfg, 'learner_disabled_params', set()))
 
         # Base configuration defaults (loaded from environment)
         self.base = {
@@ -156,6 +169,39 @@ class OnlineLearner:
             self.load()
 
     # --- Property Accessors for Engine & Bot --- #
+    def disable_module(self, module_name: str) -> None:
+        self.disabled_modules.add(module_name.strip().lower())
+
+    def enable_module(self, module_name: str) -> None:
+        self.disabled_modules.discard(module_name.strip().lower())
+
+    def disable_param(self, param_name: str) -> None:
+        self.disabled_params.add(param_name.strip().lower())
+
+    def enable_param(self, param_name: str) -> None:
+        self.disabled_params.discard(param_name.strip().lower())
+
+    def is_param_enabled(self, param_name: str) -> bool:
+        if not self.enabled or param_name == 'max_actions_per_min' or param_name in self.disabled_params:
+            return False
+        for mod, params in MODULE_PARAMS.items():
+            if param_name in params and mod in self.disabled_modules:
+                return False
+        return True
+
+    def get_access_status(self) -> dict:
+        status = {}
+        for mod, params in MODULE_PARAMS.items():
+            is_mod_off = mod in self.disabled_modules
+            p_status = {p: self.is_param_enabled(p) for p in params}
+            status[mod] = {'module_enabled': not is_mod_off, 'parameters': p_status}
+        return {
+            'online_learning_enabled': self.enabled,
+            'disabled_modules': list(self.disabled_modules),
+            'disabled_params': list(self.disabled_params),
+            'modules': status,
+        }
+
     @property
     def min_edge_bps(self) -> Decimal:
         return self.params["min_edge_bps"] if self.enabled else self.base["min_edge_bps"]
@@ -604,6 +650,10 @@ class Ledger:
         self.learner = OnlineLearner(cfg)
         self.learner.ledger = self
 
+    @property
+    def bayesian_model(self) -> ConditionalMarkoutModel:
+        return self.learner.markout_model
+
     def is_flat(self, mid: Decimal, min_notional: Decimal) -> bool:
         return abs(self.position * mid) < max(min_notional, Decimal(1))
 
@@ -612,18 +662,6 @@ class Ledger:
 
     def unrealized(self, mark: Decimal) -> Decimal:
         return (mark - self.avg_cost) * self.position if self.position != 0 else ZERO
-
-    def unrealized_pnl(self, mark: Decimal) -> Decimal:
-        return self.unrealized(mark)
-
-    def unrealized_bps(self, mark: Decimal) -> Decimal:
-        if self.position == 0 or self.avg_cost == 0:
-            return ZERO
-        return ((mark - self.avg_cost) / self.avg_cost * BPS) if self.position > 0 else ((self.avg_cost - mark) / self.avg_cost * BPS)
-
-    @property
-    def realized_pnl(self) -> Decimal:
-        return self.realized
 
     def total_pnl(self, mark: Decimal) -> Decimal:
         return self.realized + self.unrealized(mark) + getattr(self, "funding_pnl", ZERO)
@@ -640,9 +678,7 @@ class Ledger:
         return (self.spread_edge_bps_sum / self.n_fills) if self.n_fills else ZERO
 
     def on_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
-                min_notional: Decimal = Decimal("10.0"), is_maker: bool = True, **kwargs) -> Fill:
-        if "is_taker" in kwargs:
-            is_maker = not kwargs["is_taker"]
+                min_notional: Decimal, is_maker: bool = True) -> Fill:
         signed = qty if side == BUY else -qty
         was_flat = self.is_flat(mid, min_notional)
         realized_delta = ZERO

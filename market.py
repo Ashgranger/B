@@ -28,17 +28,17 @@ class Market:
     @classmethod
     def from_api(cls, d: dict) -> "Market":
         return cls(
-            market_id=int(d.get("market_id") or d.get("marketId") or 1),
-            name=str(d.get("symbol") or d.get("marketDisplayName") or "BTC-USD"),
+            market_id=int(d["marketId"]),
+            name=d["marketDisplayName"],
             status=str(d.get("status", "ONLINE")).upper(),
-            tick=Decimal(str(d.get("tick_size") or d.get("tickSize") or "0.1")),
-            step=Decimal(str(d.get("step_size") or d.get("stepSize") or "0.001")),
+            tick=Decimal(str(d["tickSize"])),
+            step=Decimal(str(d["stepSize"])),
             tiers=list(d.get("tickTiers") or []),
-            min_notional=Decimal(str(d.get("min_order_notional") or d.get("minOrderNotional") or "0")),
-            min_size=Decimal(str(d.get("min_order_size") or d.get("minOrderSize") or "0")),
-            max_size=Decimal(str(d.get("max_order_size") or d.get("maxOrderSize") or "1000")),
-            mark=Decimal(str(d.get("mark_price") or d.get("markPrice") or "0")),
-            is_outside_rth=bool(d.get("isOutsideRth", False)),
+            min_notional=Decimal(str(d.get("minOrderNotional") or "0")),
+            min_size=Decimal(str(d.get("minOrderSize") or "0")),
+            max_size=Decimal(str(d.get("maxOrderSize") or "0")),
+            mark=Decimal(str(d.get("markPrice") or "0")),
+            is_outside_rth=bool(d.get("isOutsideRth")),
             funding_rate=Decimal(str(d.get("fundingRate") or d.get("funding_rate") or "0")),
             next_funding_time=float(d.get("nextFundingTime") or d.get("next_funding_time") or 0.0),
         )
@@ -49,6 +49,14 @@ class Market:
             if up is None or price < Decimal(str(up)):
                 return Decimal(str(t["tick"]))
         return self.tick
+
+    @property
+    def tick_size(self) -> Decimal:
+        return self.tick
+
+    @property
+    def step_size(self) -> Decimal:
+        return self.step
 
 
 @dataclass
