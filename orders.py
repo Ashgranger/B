@@ -62,6 +62,9 @@ class OrderManager:
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
     async def _resync_nonce(self) -> None:
+        if getattr(self, "_resyncing", False):
+            return
+        self._resyncing = True
         try:
             n = await self.ex.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
             if n is not None and n >= 0:
@@ -70,6 +73,8 @@ class OrderManager:
                 self._consec_errors = 0
         except Exception as e:
             log.debug("Auto-resync nonce note: %s", e)
+        finally:
+            self._resyncing = False
 
     def side_orders(self, side: str) -> list[Order]:
         return sorted((o for o in self.orders.values() if o.side == side), key=lambda o: o.price, reverse=(side == BUY))
@@ -240,14 +245,13 @@ class OrderManager:
         coros = list(coros)
         if not coros:
             return
-        if len(coros) == 1:
-            await coros[0]
-            return
-        for r in await asyncio.gather(*coros, return_exceptions=True):
-            if isinstance(r, asyncio.CancelledError):
-                raise r
-            if isinstance(r, Exception):
-                log.warning("parallel order action failed: %r", r)
+        for c in coros:
+            try:
+                await c
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("order action failed: %r", e)
 
     async def cancel_side(self, side: str, now: float) -> None:
         coros = []
