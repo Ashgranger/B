@@ -290,8 +290,8 @@ class Config:
         market = str(_e("MARKET", "BTC-USD"))
         guar_sc, guar_sc_bps = _parse_guarantee_spread_capture("GUARANTEE_SPREAD_CAPTURE", "1")
 
-        account_index = int(_get_env_any("ROBINHOOD_ACCOUNT_INDEX", "LIGHTER_ACCOUNT_INDEX", "ARCUS_ACCOUNT_INDEX", default="0"))
-        api_key_index = int(_get_env_any("ROBINHOOD_API_KEY_INDEX", "LIGHTER_API_KEY_INDEX", default="4"))
+        account_index = int(_get_env_any("ROBINHOOD_ACCOUNT_INDEX", "LIGHTER_ACCOUNT_INDEX", "ACCOUNT_INDEX", "ARCUS_ACCOUNT_INDEX", default="0"))
+        api_key_index = int(_get_env_any("ROBINHOOD_API_KEY_INDEX", "LIGHTER_API_KEY_INDEX", "API_KEY_INDEX", default="4"))
 
         # Chain ID: 4663 for Robinhood Chain Mainnet, 304 for Lighter Mainnet
         default_chain_id = ENVS[env_name].get("chain_id", 4663)

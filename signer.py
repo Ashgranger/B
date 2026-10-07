@@ -597,3 +597,20 @@ class Signer:
             "timestamp": str(ts),
             "signature": self.sign_hash(message.encode()),
         }
+
+    async def close(self) -> None:
+        """Cleanly close native lighter SDK client session if initialized."""
+        if self._lighter_client is not None:
+            try:
+                close_fn = getattr(self._lighter_client, "close", None)
+                if callable(close_fn):
+                    res = close_fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+                api_client = getattr(self._lighter_client, "api_client", None)
+                if api_client and hasattr(api_client, "close") and callable(api_client.close):
+                    res = api_client.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception as e:
+                log.debug("SignerClient close note: %s", e)

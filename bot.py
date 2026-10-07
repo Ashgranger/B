@@ -84,7 +84,7 @@ class MarketMaker:
         self.ex = Exchange(cfg, self._on_channel)
         self.md = MarketData(cfg)
         self._latest_ws_orders = []
-        self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
+        self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index, cfg.api_key_index, url=self.ex.rest)
         self.ledger = Ledger(cfg)
         self.ledger.on_markout_cb = self._journal_markout
         self.md.own_provider = self._own_resting
@@ -681,12 +681,6 @@ class MarketMaker:
             # 100% WebSocket: reconcile against latest open orders streamed over WS
             if getattr(self, "_latest_ws_orders", None):
                 await self.om.reconcile(self._latest_ws_orders, now)
-            elif not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
-                # Fallback only if WS orders snapshot has not arrived yet
-                res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
-                                                    "marketId": m.market_id})
-                if res and "openOrders" in res:
-                    await self.om.reconcile(res["openOrders"], now)
         except Exception:
             pass
 
@@ -792,7 +786,7 @@ class MarketMaker:
                     await self.ex.subscribe(f"trade/{mkt_id}")
                     await self.ex.subscribe(f"market_stats/{mkt_id}")
                     try:
-                        auth_tok = self.signer.create_auth_token(28800)
+                        auth_tok = self.signer.create_auth_token(14400)
                         await self.ex.subscribe(f"account_orders/{mkt_id}/{self.cfg.account_index}", auth=auth_tok)
                         await self.ex.subscribe(f"account_market/{mkt_id}/{self.cfg.account_index}", auth=auth_tok)
                         await self.ex.subscribe(f"user_stats/{self.cfg.account_index}")
@@ -866,6 +860,11 @@ class MarketMaker:
         if self._cross_feeds is not None:
             try:
                 await self._cross_feeds.stop()
+            except Exception:
+                pass
+        if hasattr(self.signer, "close"):
+            try:
+                await self.signer.close()
             except Exception:
                 pass
         self._close_files()

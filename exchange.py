@@ -80,8 +80,11 @@ class Exchange:
         while self.is_connected:
             try:
                 await asyncio.sleep(30)
-                if self.is_connected:
-                    await self._send({"type": "ping"})
+                if self.is_connected and self.ws is not None:
+                    if hasattr(self.ws, "ping"):
+                        p = self.ws.ping()
+                        if asyncio.iscoroutine(p) or hasattr(p, "__await__"):
+                            await p
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -184,8 +187,8 @@ class Exchange:
         return await self.call("jsonapi/sendtxbatch", {"tx_types": tx_types, "tx_infos": tx_infos_str})
 
     async def get(self, rtype: str, payload: dict, timeout: float = 8.0) -> Optional[Any]:
-        r = await self.call("get", {"type": rtype, "payload": payload}, timeout)
-        return r.get("result") if r.get("status") == 200 else None
+        log.debug("ex.get(%s) ignored on pure WebSocket transport", rtype)
+        return None
 
     async def subscribe(self, channel: str, sub_id: str = "", **extra) -> bool:
         """Subscribe to a Lighter channel (e.g. order_book/{market_id}, ticker/{market_id})."""
@@ -210,11 +213,7 @@ class Exchange:
         mtype = str(msg.get("type", ""))
 
         # 1. Ping / Pong keepalive
-        if mtype == "pong":
-            return
-        if mtype == "ping":
-            if self.is_connected:
-                asyncio.create_task(self._send({"type": "pong"}))
+        if mtype in ("pong", "ping"):
             return
 
         # 2. Transaction responses
@@ -384,8 +383,10 @@ class Exchange:
             m_id = r.get("market_id") if r.get("market_id") is not None else r.get("marketId")
             if s_name:
                 known_syms.append(f"{s_name} (ID {m_id})")
-        if known_syms:
-            log.info("Discovered %d markets on %s: %s", len(rows), self.cfg.env_name, ", ".join(known_syms[:15]))
+        if not getattr(self, "_discovery_logged", False):
+            self._discovery_logged = True
+            if known_syms:
+                log.info("Discovered %d markets on %s: %s", len(rows), self.cfg.env_name, ", ".join(known_syms[:15]))
 
         if market:
             norm_target = _norm_symbol(market)
