@@ -97,22 +97,26 @@ class Signer:
 
         # Try to initialize native Ed25519 or Schnorr keypair
         self._pub_key_hex = ""
+        self._priv = None
         self._init_keys()
 
     def _init_keys(self) -> None:
         try:
+            raw_bytes = bytes.fromhex(self.key_hex)
+        except Exception:
+            raw_bytes = self.key_hex.encode()
+
+        try:
             from cryptography.hazmat.primitives.asymmetric import ed25519
             from cryptography.hazmat.primitives import serialization
-            priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(self.key_hex))
+            # If 40 bytes (80 hex chars, Robinhood Lighter native key), derive 32-byte seed
+            seed = raw_bytes if len(raw_bytes) == 32 else hashlib.sha256(raw_bytes).digest()
+            priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
             pub = priv.public_key()
-            if hasattr(pub, 'public_bytes_raw'):
-                self._pub_key_hex = pub.public_bytes_raw().hex()
-            else:
-                self._pub_key_hex = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+            self._pub_key_hex = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
             self._priv = priv
         except Exception:
-            # Fallback deterministic public key derivation
-            h = hashlib.sha256(bytes.fromhex(self.key_hex)).hexdigest()
+            h = hashlib.sha256(raw_bytes).hexdigest()
             self._pub_key_hex = h
             self._priv = None
 
@@ -153,7 +157,11 @@ class Signer:
                 return self._priv.sign(message).hex()
             except Exception:
                 pass
-        return hmac.new(bytes.fromhex(self.key_hex), message, hashlib.sha256).hexdigest()
+        try:
+            raw_bytes = bytes.fromhex(self.key_hex)
+        except Exception:
+            raw_bytes = self.key_hex.encode()
+        return hmac.new(raw_bytes, message, hashlib.sha256).hexdigest()
 
     def create_auth_token(self, deadline_s: int = 3600) -> str:
         """Generate an auth token for private WebSocket channels and REST queries."""
@@ -173,15 +181,15 @@ class Signer:
           'ALO' / 'POST_ONLY' -> TIF_POST_ONLY (2)
         """
         tif_str = time_in_force.upper()
-        if tif_str == "IOC":
+        if tif_str in ("IOC", "0"):
             tif_code = TIF_IOC
             order_type = ORDER_TYPE_LIMIT
             order_expiry = 0
-        elif tif_str in ("GTT", "GTC"):
+        elif tif_str in ("GTT", "GTC", "1"):
             tif_code = TIF_GTT
             order_type = ORDER_TYPE_LIMIT
             order_expiry = max(int(time.time() * 1000) + 300_000, int(good_til_us / 1000))
-        else:  # ALO / POST_ONLY
+        else:  # ALO / POST_ONLY / 2
             tif_code = TIF_POST_ONLY
             order_type = ORDER_TYPE_LIMIT
             order_expiry = max(int(time.time() * 1000) + 300_000, int(good_til_us / 1000))

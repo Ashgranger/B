@@ -137,6 +137,7 @@ class OrderManager:
                                 time_in_force=time_in_force, reduce_only=reduce_only)
         self.maybe_orders = True
         self.last_place_ts = now
+        # Direct WebSocket transmission via jsonapi/sendtx
         resp = await self.ex.write(req)
         res = resp.get("result") or {}
         code = resp.get("code") or resp.get("status")
@@ -178,6 +179,7 @@ class OrderManager:
         px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
         req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
+        # Direct WebSocket transmission
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
@@ -195,7 +197,9 @@ class OrderManager:
         o.cancelling_since = now
         self._recently_closed.append((now, o.order_id))
         self._budget(now)
-        resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
+        req = self.signer.cancel(self.get_market(), o.order_id)
+        # Direct WebSocket transmission
+        resp = await self.ex.write(req)
         if self.cfg.dry_run or "ORDER_NOT_FOUND" in json.dumps(resp):
             self._remove_order(o.order_id)
         elif not self._ok(resp):
@@ -237,29 +241,22 @@ class OrderManager:
         await self._gather(coros)
 
     async def cancel_all(self, force: bool = False) -> None:
+        """Cancel all resting orders directly over WebSocket (TxTypeL2CancelAllOrders = 16)."""
         if not force and not self.orders and not self.maybe_orders:
             return
         m = self.get_market()
         now = time.time()
+        # 1. Cancel tracked local orders
         await self._gather([self.cancel(o, now) for o in list(self.orders.values())])
 
+        # 2. Issue a batch cancelAll directly over WebSocket to instantly wipe exchange book
         if (force or self.maybe_orders) and not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
             try:
-                res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
-                                                    "marketId": m.market_id})
-                if res and "openOrders" in res:
-                    reqs = []
-                    for r in res["openOrders"]:
-                        if isinstance(r, dict):
-                            r_mkt = r.get("market_index") or r.get("marketId")
-                            if r_mkt is not None and int(r_mkt) != m.market_id:
-                                continue
-                            oid = str(r.get("client_order_id") or r.get("client_order_index") or r.get("orderId") or r.get("id"))
-                            if oid and oid != "None" and oid not in self.orders:
-                                reqs.append(self.ex.write(self.signer.cancel(m, oid)))
-                    await self._gather(reqs)
-            except Exception:
-                pass
+                req = self.signer.cancel_all(m, immediate=True)
+                await self.ex.write(req)
+                log.info("Sent WebSocket cancel_all for market %s (id %d)", m.name, m.market_id)
+            except Exception as e:
+                log.debug("WebSocket cancel_all note: %s", e)
 
         self.orders.clear()
         self.pair_slots.clear()
@@ -439,6 +436,7 @@ class OrderManager:
             self._remove_order(o.order_id)
 
     async def reconcile(self, rows: list, now: float) -> None:
+        """Reconcile in-memory state against WebSocket orders snapshot."""
         m = self.get_market()
         market_rows = []
         for r in rows:

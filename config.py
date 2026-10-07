@@ -9,10 +9,10 @@ from decimal import Decimal
 from utils import Fatal
 
 ENVS = {
-    "rh_mainnet": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream"},
-    "robinhood": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream"},
-    "mainnet": {"rest": "https://mainnet.zklighter.elliot.ai", "ws": "wss://mainnet.zklighter.elliot.ai/stream"},
-    "testnet": {"rest": "https://testnet.zklighter.elliot.ai", "ws": "wss://testnet.zklighter.elliot.ai/stream"},
+    "rh_mainnet": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream", "chain_id": 4663},
+    "robinhood": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream", "chain_id": 4663},
+    "mainnet": {"rest": "https://mainnet.zklighter.elliot.ai", "ws": "wss://mainnet.zklighter.elliot.ai/stream", "chain_id": 304},
+    "testnet": {"rest": "https://testnet.zklighter.elliot.ai", "ws": "wss://testnet.zklighter.elliot.ai/stream", "chain_id": 304},
 }
 
 
@@ -73,6 +73,7 @@ class Config:
     signing_key: str
     account_index: int
     api_key_index: int
+    chain_id: int
     market: str
     dry_run: bool
 
@@ -239,6 +240,22 @@ class Config:
     cross_div_adverse_mult: float = 1.0
     cross_flow_weight: float = 0.3
 
+    @property
+    def api_key(self) -> str:
+        return self.signing_key
+
+    @property
+    def private_key(self) -> str:
+        return self.signing_key
+
+    @property
+    def l1_address(self) -> str:
+        return self.address
+
+    @property
+    def wallet_address(self) -> str:
+        return self.address
+
     @classmethod
     def from_env(cls) -> "Config":
         raw_env = _get_env_any("ROBINHOOD_LIGHTER_ENV", "LIGHTER_ENV", "ARCUS_ENV", default="rh_mainnet").lower()
@@ -257,9 +274,17 @@ class Config:
         if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
             raise Fatal("Wallet address must be a valid 0x 20-byte Ethereum / Robinhood Chain address")
 
-        key = _get_env_any("ROBINHOOD_API_PRIVATE_KEY", "LIGHTER_API_PRIVATE_KEY", "ARCUS_API_SIGNING_KEY", default="").removeprefix("0x")
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
-            raise Fatal("API Signing Key must be a valid 64-hex private key")
+        raw_key = _get_env_any(
+            "ROBINHOOD_API_PRIVATE_KEY", "LIGHTER_API_KEY", "LIGHTER_API_PRIVATE_KEY", "ARCUS_API_SIGNING_KEY", default=""
+        )
+        # Clean quotes, whitespace, and 0x prefix
+        key = re.sub(r"\s+", "", raw_key.strip().strip("'\""))
+        if key.lower().startswith("0x"):
+            key = key[2:]
+
+        # Accept 80-character (40 bytes, native Robinhood Lighter key), 64-character (32 bytes), or valid hex string
+        if not re.fullmatch(r"[0-9a-fA-F]{32,128}", key):
+            raise Fatal(f"API Signing Key must be a valid hex private key (received length {len(key)}, expected 80-hex for Robinhood Lighter or 64-hex)")
 
         dry = _b("DRY_RUN", "1")
         market = str(_e("MARKET", "BTC-USD"))
@@ -268,12 +293,17 @@ class Config:
         account_index = int(_get_env_any("ROBINHOOD_ACCOUNT_INDEX", "LIGHTER_ACCOUNT_INDEX", "ARCUS_ACCOUNT_INDEX", default="0"))
         api_key_index = int(_get_env_any("ROBINHOOD_API_KEY_INDEX", "LIGHTER_API_KEY_INDEX", default="4"))
 
+        # Chain ID: 4663 for Robinhood Chain Mainnet, 304 for Lighter Mainnet
+        default_chain_id = ENVS[env_name].get("chain_id", 4663)
+        chain_id = int(_get_env_any("ROBINHOOD_CHAIN_ID", "LIGHTER_CHAIN_ID", "CHAIN_ID", default=str(default_chain_id)))
+
         cfg = cls(
             env_name=env_name,
             address=address,
             signing_key=key,
             account_index=account_index,
             api_key_index=api_key_index,
+            chain_id=chain_id,
             market=market,
             dry_run=dry,
             order_usd=_d("ORDER_USD", "30"),

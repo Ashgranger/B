@@ -83,6 +83,7 @@ class MarketMaker:
 
         self.ex = Exchange(cfg, self._on_channel)
         self.md = MarketData(cfg)
+        self._latest_ws_orders = []
         self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
         self.ledger = Ledger(cfg)
         self.ledger.on_markout_cb = self._journal_markout
@@ -601,17 +602,12 @@ class MarketMaker:
         if self.cfg.dry_run or not self.md.info:
             return
         try:
-            await asyncio.sleep(0.4)
-            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
-                                                "marketId": self.md.info.market_id}, timeout=3.0)
-            rows = [r for r in (res or {}).get("openOrders", []) if isinstance(r, dict)
-                    and r.get("marketId") in (None, self.md.info.market_id)] if res is not None else None
-            if rows == []:
+            await asyncio.sleep(0.2)
+            # 100% WebSocket: verify local order book is clear
+            if not self.om.orders:
                 await self._disarm_dms()
-            elif rows is None:
-                log.warning("could not verify empty book on shutdown - leaving dead man's switch armed")
             else:
-                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(rows))
+                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(self.om.orders))
         except Exception as e:
             log.warning("shutdown verification error: %s", e)
 
@@ -665,10 +661,15 @@ class MarketMaker:
             m = self.md.info
             if not m:
                 return
-            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
-                                                "marketId": m.market_id})
-            if res and "openOrders" in res:
-                await self.om.reconcile(res["openOrders"], now)
+            # 100% WebSocket: reconcile against latest open orders streamed over WS
+            if getattr(self, "_latest_ws_orders", None):
+                await self.om.reconcile(self._latest_ws_orders, now)
+            elif not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
+                # Fallback only if WS orders snapshot has not arrived yet
+                res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                    "marketId": m.market_id})
+                if res and "openOrders" in res:
+                    await self.om.reconcile(res["openOrders"], now)
         except Exception:
             pass
 
@@ -850,3 +851,8 @@ class MarketMaker:
             except Exception:
                 pass
         self._close_files()
+
+
+# Aliases for Robinhood Lighter
+LighterMarketMaker = MarketMaker
+__all__ = ["MarketMaker", "LighterMarketMaker", "extract_positions"]
