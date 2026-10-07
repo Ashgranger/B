@@ -242,6 +242,23 @@ class MarketMaker:
             px = Decimal(str(tr.get("price") or "0"))
             if sz > 0:
                 self.md.on_trade(side, sz, px, now)
+
+            # Check if this trade is OUR fill on Robinhood Lighter
+            ask_acc = tr.get("ask_account_id")
+            bid_acc = tr.get("bid_account_id")
+            my_acc = self.cfg.account_index
+            if my_acc is not None and (ask_acc == my_acc or bid_acc == my_acc):
+                fill_side = SELL if ask_acc == my_acc else BUY
+                for o in list(self.om.orders.values()):
+                    if o.side == fill_side and abs(o.price - px) <= Decimal("0.05"):
+                        o.filled_any = True
+                        fill_qty = min(sz, o.remaining)
+                        o.remaining -= fill_qty
+                        log.info("OUR FILL from trade stream: %s %s @ %s (remaining: %s)", fill_side, fmt(fill_qty), fmt(px), fmt(o.remaining))
+                        self._on_fill(fill_side, fill_qty, px, o)
+                        if o.remaining <= 0:
+                            self.om._remove_order(o.order_id)
+                        break
         except Exception:
             pass
 
@@ -782,13 +799,14 @@ class MarketMaker:
                     except Exception as e:
                         log.debug("Private stream auth note: %s", e)
 
-                    # Standard & Sim channel compatibility
-                    await self.ex.subscribe("bbo", self.cfg.market)
-                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
-                    await self.ex.subscribe("trades", self.cfg.market)
-                    await self.ex.subscribe("orders", self.cfg.address)
-                    await self.ex.subscribe("userFills", self.cfg.address)
-                    await self.ex.subscribe("positions", self.cfg.address)
+                    # Simulator-only channel compatibility (never send to live Lighter WebSocket)
+                    if hasattr(self.ex.ws, "_post") or getattr(self.ex, "is_sim", False):
+                        await self.ex.subscribe("bbo", self.cfg.market)
+                        await self.ex.subscribe("l2Orderbook", self.cfg.market)
+                        await self.ex.subscribe("trades", self.cfg.market)
+                        await self.ex.subscribe("orders", self.cfg.address)
+                        await self.ex.subscribe("userFills", self.cfg.address)
+                        await self.ex.subscribe("positions", self.cfg.address)
 
                     reconnect_delay = 1.0
                     self._last_heartbeat = 0.0

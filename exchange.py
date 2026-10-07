@@ -1,4 +1,4 @@
-"""Transport client for Robinhood Lighter Perpetual DEX: WebSocket streaming & zk-transactions."""
+"""Transport client for Robinhood Lighter Perpetual DEX: 100% WebSocket streaming & zk-transactions."""
 from __future__ import annotations
 
 import asyncio
@@ -27,6 +27,15 @@ try:
 except ImportError:
     class ConnectionClosed(Exception):
         pass
+
+
+def _norm_symbol(s: str) -> str:
+    s = str(s or "").upper().strip()
+    for suff in ("USDC", "USDT", "USD"):
+        if s.endswith(suff):
+            s = s[:-len(suff)]
+            break
+    return s.replace("/", "").replace("-", "").replace("_", "").strip()
 
 
 class Exchange:
@@ -67,7 +76,7 @@ class Exchange:
         self._pending.clear()
 
     async def _ping_loop(self) -> None:
-        """Keepalive required by Lighter: send ping frame every 30-45s (must be < 120s)."""
+        """Keepalive required by Lighter: send ping frame every 30s (must be < 120s)."""
         while self.is_connected:
             try:
                 await asyncio.sleep(30)
@@ -99,17 +108,45 @@ class Exchange:
         self._pending[rid] = fut
         self._pending[str(rid)] = fut
         try:
-            ws_msg = {
-                "type": kind,
-                "id": rid,
-                "request": request,
-            }
-            if "tx_type" in request:
-                ws_msg["data"] = {
-                    "id": str(rid),
-                    "tx_type": request["tx_type"],
-                    "tx_info": request.get("tx_info", request.get("payload", {})),
+            is_sim = hasattr(self.ws, "_post")
+
+            if "tx_type" in request or kind in ("jsonapi/sendtx", "sendtx", "write", "post"):
+                tx_type = request.get("tx_type", 14)
+                tx_info = request.get("tx_info", request.get("payload", {}))
+                tx_info_str = tx_info if isinstance(tx_info, str) else json.dumps(tx_info, separators=(",", ":"))
+
+                if is_sim:
+                    ws_msg = {
+                        "type": "post",
+                        "id": rid,
+                        "request": request,
+                        "data": {
+                            "id": str(rid),
+                            "tx_type": int(tx_type),
+                            "tx_info": tx_info_str,
+                        }
+                    }
+                else:
+                    # Lighter native WebSocket transaction format
+                    ws_msg = {
+                        "type": "jsonapi/sendtx",
+                        "data": {
+                            "id": str(rid),
+                            "tx_type": int(tx_type),
+                            "tx_info": tx_info_str,
+                        }
+                    }
+            elif kind == "jsonapi/sendtxbatch" or ("tx_types" in request and "tx_infos" in request):
+                ws_msg = {
+                    "type": "jsonapi/sendtxbatch",
+                    "data": {
+                        "id": str(rid),
+                        "tx_types": request["tx_types"],
+                        "tx_infos": request["tx_infos"],
+                    }
                 }
+            else:
+                ws_msg = {"type": kind, "id": rid, "request": request}
 
             sent = await self._send(ws_msg)
             if not sent and not self.cfg.dry_run:
@@ -132,10 +169,10 @@ class Exchange:
                 return {"status": 202, "code": 200, "result": {"orderId": oid, "status": "ACK"}}
             return {"status": 202, "code": 200, "result": {"status": "ACK"}}
 
-        return await self.call("post", request)
+        return await self.call("jsonapi/sendtx", request)
 
     async def write_batch(self, requests: list[dict]) -> dict:
-        """Send up to 50 transactions in a single batch over Lighter WebSocket."""
+        """Send up to 50 transactions in a single frame over Lighter WebSocket."""
         if not requests:
             return {"status": 200, "code": 200}
         if self.cfg.dry_run:
@@ -143,7 +180,8 @@ class Exchange:
 
         tx_types = [r.get("tx_type", 14) for r in requests]
         tx_infos = [r.get("tx_info", r.get("payload")) for r in requests]
-        return await self.call("jsonapi/sendtxbatch", {"tx_types": tx_types, "tx_infos": tx_infos})
+        tx_infos_str = [json.dumps(t, separators=(",", ":")) if isinstance(t, dict) else str(t) for t in tx_infos]
+        return await self.call("jsonapi/sendtxbatch", {"tx_types": tx_types, "tx_infos": tx_infos_str})
 
     async def get(self, rtype: str, payload: dict, timeout: float = 8.0) -> Optional[Any]:
         r = await self.call("get", {"type": rtype, "payload": payload}, timeout)
@@ -171,7 +209,7 @@ class Exchange:
 
         mtype = str(msg.get("type", ""))
 
-        # 1. Ping / Pong
+        # 1. Ping / Pong keepalive
         if mtype == "pong":
             return
         if mtype == "ping":
@@ -221,6 +259,10 @@ class Exchange:
                         "price": tr.get("price"),
                         "size": tr.get("size"),
                         "timestamp": tr.get("timestamp"),
+                        "ask_account_id": tr.get("ask_account_id"),
+                        "bid_account_id": tr.get("bid_account_id"),
+                        "ask_id": tr.get("ask_id"),
+                        "bid_id": tr.get("bid_id"),
                     })
                 self.on_channel("trades", trades_clean, is_snap)
                 return
@@ -286,17 +328,29 @@ class Exchange:
             self.ws = None
 
     async def fetch_markets(self, market: Optional[str] = None) -> list:
+        """
+        Fetch market metadata from Robinhood Lighter perpetual DEX.
+        Uses GET /api/v1/orderBookDetails with intelligent symbol normalization.
+        """
         def _get():
             url = f"{self.rest}/api/v1/orderBookDetails"
             req = urllib.request.Request(url, headers={"accept": "application/json", "User-Agent": "LighterBot/1.0"})
             try:
                 with urllib.request.urlopen(req, timeout=10) as r:
                     data = json.loads(r.read())
-                    if "order_book_details" in data:
-                        return data["order_book_details"]
-                    if "markets" in data:
-                        return data["markets"]
-                    return data
+                    if isinstance(data, dict):
+                        if "order_book_details" in data:
+                            return data["order_book_details"]
+                        if "orderBookDetails" in data:
+                            return data["orderBookDetails"]
+                        if "result" in data:
+                            res = data["result"]
+                            return res.get("order_book_details", res.get("markets", [res]))
+                        if "markets" in data:
+                            return data["markets"]
+                    elif isinstance(data, list):
+                        return data
+                    return [data]
             except Exception as e:
                 alt_url = f"{self.rest}/v1/markets" + (f"?market={market}" if market else "")
                 req2 = urllib.request.Request(alt_url, headers={"accept": "application/json", "User-Agent": "LighterBot/1.0"})
@@ -305,8 +359,8 @@ class Exchange:
                         data2 = json.loads(r2.read())
                         return data2.get("markets", [])
                 except Exception as e2:
-                    log.warning("REST fetch_markets failed (%s); using native WebSocket fallback profile", e2)
-                    p_dec = 2 if "NVDA" in (market or "").upper() or "ETH" in (market or "").upper() else 1
+                    log.warning("REST fetch_markets unreachable (%s); using native profile", e2)
+                    p_dec = 2 if market and ("NVDA" in market.upper() or "ETH" in market.upper()) else 1
                     s_dec = 4
                     return [{
                         "market_id": 0,
@@ -320,14 +374,40 @@ class Exchange:
                     }]
 
         rows = await asyncio.to_thread(_get)
+        if not rows:
+            return [{"market_id": 0, "symbol": market or "NVDA-USD", "price_decimals": 2, "size_decimals": 4, "status": "ACTIVE"}]
+
+        # Log discovered markets on Robinhood Lighter
+        known_syms = []
+        for r in rows:
+            s_name = str(r.get("symbol") or r.get("marketDisplayName") or r.get("name") or "")
+            m_id = r.get("market_id") if r.get("market_id") is not None else r.get("marketId")
+            if s_name:
+                known_syms.append(f"{s_name} (ID {m_id})")
+        if known_syms:
+            log.info("Discovered %d markets on %s: %s", len(rows), self.cfg.env_name, ", ".join(known_syms[:15]))
+
         if market:
-            norm_mkt = market.upper().replace("/", "-")
-            matched = [
-                m for m in rows
-                if str(m.get("symbol") or m.get("marketDisplayName") or m.get("name") or "").upper().replace("/", "-") == norm_mkt
-            ]
+            norm_target = _norm_symbol(market)
+            raw_upper = market.upper().strip()
+
+            matched = []
+            for m in rows:
+                sym = str(m.get("symbol") or m.get("marketDisplayName") or m.get("name") or "").upper().strip()
+                norm_sym = _norm_symbol(sym)
+                m_id = str(m.get("market_id") if m.get("market_id") is not None else m.get("marketId", ""))
+
+                if (sym == raw_upper or norm_sym == norm_target or
+                    (norm_target and norm_target in norm_sym) or
+                    (m_id and m_id == raw_upper)):
+                    matched.append(m)
+                    break
+
             if not matched:
-                log.warning("market %s not directly matched in orderBookDetails; using default profile", market)
-                return [{"market_id": 0, "symbol": market, "price_decimals": 2, "size_decimals": 4, "status": "active"}]
+                log.warning("market '%s' (normalized: '%s') not matched in orderBookDetails. Available: %s",
+                            market, norm_target, ", ".join(known_syms[:10]))
+                return rows[:1]
+
             return matched
+
         return rows

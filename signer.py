@@ -82,22 +82,24 @@ class Signer:
     TIF_FOK = TIF_IOC
     TIF_GTC = TIF_GTT
 
-    def __init__(self, key_hex: str, address: str, account_index: int = 0, api_key_index: int = 4):
+    def __init__(self, key_hex: str, address: str, account_index: int = 0, api_key_index: int = 4,
+                 url: str = "https://api.rh.lighter.xyz"):
         self.key_hex = key_hex.removeprefix("0x").lower()
         self.address = address
         self.addr_lc = address.lower()
         self.account_index = int(account_index)
         self.api_key_index = int(api_key_index)
-        self.ai = self.account_index  # alias
+        self.url = url
+        self.ai = self.account_index
 
         self._nonce = 0
         self._nonce_initialized = False
         self._client_order_seq = int(time.time() * 1000) % (2 ** 32)
         self._last_ts = 0
 
-        # Try to initialize native Ed25519 or Schnorr keypair
         self._pub_key_hex = ""
         self._priv = None
+        self._lighter_client = None
         self._init_keys()
 
     def _init_keys(self) -> None:
@@ -106,6 +108,20 @@ class Signer:
         except Exception:
             raw_bytes = self.key_hex.encode()
 
+        # 1. Try native lighter SDK SignerClient if available
+        try:
+            import lighter
+            self._lighter_client = lighter.SignerClient(
+                url=self.url,
+                api_private_keys={self.api_key_index: self.key_hex},
+                account_index=self.account_index,
+            )
+            log.info("Initialized native Lighter SignerClient successfully (API Key Index %d)", self.api_key_index)
+        except Exception as e:
+            self._lighter_client = None
+            log.debug("Native Lighter SignerClient not loaded (%s); using pure-Python engine", e)
+
+        # 2. Key derivation for tests and pure-Python execution
         try:
             from cryptography.hazmat.primitives.asymmetric import ed25519
             from cryptography.hazmat.primitives import serialization
@@ -163,8 +179,19 @@ class Signer:
             raw_bytes = self.key_hex.encode()
         return hmac.new(raw_bytes, message, hashlib.sha256).hexdigest()
 
-    def create_auth_token(self, deadline_s: int = 3600) -> str:
+    def create_auth_token(self, deadline_s: int = 28800) -> str:
         """Generate an auth token for private WebSocket channels and REST queries."""
+        if self._lighter_client is not None:
+            try:
+                token, err = self._lighter_client.create_auth_token_with_expiry(
+                    deadline=deadline_s,
+                    api_key_index=self.api_key_index
+                )
+                if not err and token:
+                    return str(token)
+            except Exception as e:
+                log.warning("native create_auth_token error: %s", e)
+
         exp = int(time.time()) + deadline_s
         payload = f"{self.addr_lc}:{self.account_index}:{self.api_key_index}:{exp}"
         sig = self.sign_hash(payload.encode())
@@ -203,6 +230,43 @@ class Signer:
         int_price = to_lighter_int(px, price_decimals)
         int_base_amount = to_lighter_int(qty, size_decimals)
 
+        # Delegate to native Lighter SDK signer if available
+        if self._lighter_client is not None:
+            try:
+                tx_type, tx_info, err = self._lighter_client.sign_create_order(
+                    market_index=m.market_id,
+                    client_order_index=c_order_idx,
+                    base_amount=int_base_amount,
+                    price=int_price,
+                    is_ask=(1 if is_ask else 0),
+                    order_type=order_type,
+                    time_in_force=tif_code,
+                    reduce_only=(1 if reduce_only else 0),
+                    order_expiry=order_expiry,
+                    nonce=nonce,
+                    api_key_index=self.api_key_index,
+                )
+                if not err and tx_info:
+                    return {
+                        "type": "placeOrder",
+                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CREATE_ORDER,
+                        "tx_info": tx_info,
+                        "clientOrderIndex": c_order_idx,
+                        "orderId": str(c_order_idx),
+                        "payload": {
+                            "address": self.address, "accountIndex": self.account_index, "apiKeyIndex": self.api_key_index,
+                            "marketId": m.market_id, "clientOrderIndex": c_order_idx, "orderSide": side.upper(),
+                            "isAsk": bool(is_ask), "quantity": fmt(qty), "price": fmt(px), "timeInForce": "post-only" if tif_code == TIF_POST_ONLY else "immediate-or-cancel",
+                            "reduceOnly": bool(reduce_only), "nonce": nonce, "tx_type": TX_TYPE_CREATE_ORDER, "tx_info": tx_info
+                        },
+                        "apiKey": self.api_key,
+                        "signature": "",
+                        "timestamp": str(self.next_ts()),
+                    }
+            except Exception as e:
+                log.debug("Native sign_create_order fallback to python: %s", e)
+
+        # Pure-Python signer
         tx_info = {
             "AccountIndex": self.account_index,
             "ApiKeyIndex": self.api_key_index,
@@ -258,13 +322,39 @@ class Signer:
 
     def modify(self, m: Market, order_id: str | int, side: str, px: Decimal, qty: Decimal,
                good_til_us: int, reduce_only: bool = False, order_version: int = 0) -> dict:
-        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "") or 0)
+        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "").replace("sim-", "") or 0)
         nonce = self.next_nonce()
 
         price_decimals = getattr(m, "price_decimals", 2)
         size_decimals = getattr(m, "size_decimals", 4)
         int_price = to_lighter_int(px, price_decimals)
         int_base_amount = to_lighter_int(qty, size_decimals)
+
+        if self._lighter_client is not None:
+            try:
+                tx_type, tx_info, err = self._lighter_client.sign_modify_order(
+                    market_index=m.market_id,
+                    order_index=c_order_idx,
+                    base_amount=int_base_amount,
+                    price=int_price,
+                    order_version=order_version,
+                    nonce=nonce,
+                    api_key_index=self.api_key_index,
+                )
+                if not err and tx_info:
+                    return {
+                        "type": "modifyOrder",
+                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_MODIFY_ORDER,
+                        "tx_info": tx_info,
+                        "payload": {"marketId": m.market_id, "orderId": str(order_id), "price": fmt(px), "quantity": fmt(qty), "tx_type": TX_TYPE_MODIFY_ORDER},
+                        "orderId": str(order_id),
+                        "clientOrderIndex": c_order_idx,
+                        "apiKey": self.api_key,
+                        "signature": "",
+                        "timestamp": str(self.next_ts()),
+                    }
+            except Exception as e:
+                log.debug("Native sign_modify_order fallback: %s", e)
 
         tx_info = {
             "AccountIndex": self.account_index,
@@ -312,8 +402,31 @@ class Signer:
         }
 
     def cancel(self, m: Market, order_id: str | int) -> dict:
-        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "") or 0)
+        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "").replace("sim-", "") or 0)
         nonce = self.next_nonce()
+
+        if self._lighter_client is not None:
+            try:
+                tx_type, tx_info, err = self._lighter_client.sign_cancel_order(
+                    market_index=m.market_id,
+                    order_index=c_order_idx,
+                    nonce=nonce,
+                    api_key_index=self.api_key_index,
+                )
+                if not err and tx_info:
+                    return {
+                        "type": "cancelOrder",
+                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ORDER,
+                        "tx_info": tx_info,
+                        "payload": {"marketId": m.market_id, "orderId": str(order_id), "clientOrderIndex": c_order_idx, "tx_type": TX_TYPE_CANCEL_ORDER},
+                        "orderId": str(order_id),
+                        "clientOrderIndex": c_order_idx,
+                        "apiKey": self.api_key,
+                        "signature": "",
+                        "timestamp": str(self.next_ts()),
+                    }
+            except Exception as e:
+                log.debug("Native sign_cancel_order fallback: %s", e)
 
         tx_info = {
             "AccountIndex": self.account_index,
@@ -360,6 +473,28 @@ class Signer:
             tif = CANCEL_ALL_ABORT
             expiry_ms = 0
 
+        if self._lighter_client is not None:
+            try:
+                tx_type, tx_info, err = self._lighter_client.sign_cancel_all_orders(
+                    time_in_force=tif,
+                    timestamp_ms=expiry_ms,
+                    cancel_all_market_index=m.market_id,
+                    nonce=nonce,
+                    api_key_index=self.api_key_index,
+                )
+                if not err and tx_info:
+                    return {
+                        "type": "scheduleCancel",
+                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ALL_ORDERS,
+                        "tx_info": tx_info,
+                        "payload": {"marketId": m.market_id, "timeInForce": tif, "deadline_ms": expiry_ms, "tx_type": TX_TYPE_CANCEL_ALL_ORDERS},
+                        "apiKey": self.api_key,
+                        "signature": "",
+                        "timestamp": str(self.next_ts()),
+                    }
+            except Exception as e:
+                log.debug("Native sign_schedule_cancel fallback: %s", e)
+
         tx_info = {
             "AccountIndex": self.account_index,
             "ApiKeyIndex": self.api_key_index,
@@ -397,11 +532,34 @@ class Signer:
 
     def cancel_all(self, m: Market, immediate: bool = True) -> dict:
         nonce = self.next_nonce()
+        tif = CANCEL_ALL_IMMEDIATE if immediate else CANCEL_ALL_SCHEDULED
+        if self._lighter_client is not None:
+            try:
+                tx_type, tx_info, err = self._lighter_client.sign_cancel_all_orders(
+                    time_in_force=tif,
+                    timestamp_ms=0,
+                    cancel_all_market_index=m.market_id,
+                    nonce=nonce,
+                    api_key_index=self.api_key_index,
+                )
+                if not err and tx_info:
+                    return {
+                        "type": "cancelAllOrders",
+                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ALL_ORDERS,
+                        "tx_info": tx_info,
+                        "payload": {"marketId": m.market_id, "timeInForce": tif, "tx_type": TX_TYPE_CANCEL_ALL_ORDERS},
+                        "apiKey": self.api_key,
+                        "signature": "",
+                        "timestamp": str(self.next_ts()),
+                    }
+            except Exception as e:
+                log.debug("Native sign_cancel_all fallback: %s", e)
+
         tx_info = {
             "AccountIndex": self.account_index,
             "ApiKeyIndex": self.api_key_index,
             "MarketIndex": m.market_id,
-            "TimeInForce": CANCEL_ALL_IMMEDIATE if immediate else CANCEL_ALL_SCHEDULED,
+            "TimeInForce": tif,
             "CancelAllTime": 0,
             "Nonce": nonce,
         }
