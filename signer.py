@@ -255,6 +255,7 @@ class Signer:
                     order_type=order_type,
                     time_in_force=tif_code,
                     reduce_only=bool(reduce_only),
+                    trigger_price=0,
                     order_expiry=order_expiry,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
@@ -351,6 +352,7 @@ class Signer:
                     order_index=c_order_idx,
                     base_amount=int_base_amount,
                     price=int_price,
+                    trigger_price=0,
                     order_version=order_version,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
@@ -620,15 +622,13 @@ class Signer:
         """Cleanly close native lighter SDK client session if initialized."""
         if self._lighter_client is not None:
             try:
+                import inspect
                 close_fn = getattr(self._lighter_client, "close", None)
-                if callable(close_fn):
+                if inspect.iscoroutinefunction(close_fn):
+                    await close_fn()
+                elif callable(close_fn):
                     res = close_fn()
-                    if asyncio.iscoroutine(res):
-                        await res
-                api_client = getattr(self._lighter_client, "api_client", None)
-                if api_client and hasattr(api_client, "close") and callable(api_client.close):
-                    res = api_client.close()
-                    if asyncio.iscoroutine(res):
+                    if inspect.isawaitable(res):
                         await res
             except Exception as e:
                 log.debug("SignerClient close note: %s", e)
