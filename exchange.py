@@ -116,7 +116,14 @@ class Exchange:
             if "tx_type" in request or kind in ("jsonapi/sendtx", "sendtx", "write", "post"):
                 tx_type = request.get("tx_type", 14)
                 tx_info = request.get("tx_info", request.get("payload", {}))
-                tx_info_str = tx_info if isinstance(tx_info, str) else json.dumps(tx_info, separators=(",", ":"))
+                # In Lighter WebSocket protocol, jsonapi/sendtx expects tx_info as an unescaped JSON object
+                if isinstance(tx_info, str):
+                    try:
+                        tx_info_payload = json.loads(tx_info)
+                    except Exception:
+                        tx_info_payload = tx_info
+                else:
+                    tx_info_payload = tx_info
 
                 if is_sim:
                     ws_msg = {
@@ -126,26 +133,36 @@ class Exchange:
                         "data": {
                             "id": str(rid),
                             "tx_type": int(tx_type),
-                            "tx_info": tx_info_str,
+                            "tx_info": tx_info_payload,
                         }
                     }
                 else:
-                    # Lighter native WebSocket transaction format
+                    # Lighter native WebSocket transaction format: tx_info is a JSON object
                     ws_msg = {
                         "type": "jsonapi/sendtx",
                         "data": {
                             "id": str(rid),
                             "tx_type": int(tx_type),
-                            "tx_info": tx_info_str,
+                            "tx_info": tx_info_payload,
                         }
                     }
             elif kind == "jsonapi/sendtxbatch" or ("tx_types" in request and "tx_infos" in request):
+                raw_infos = request.get("tx_infos", [])
+                parsed_infos = []
+                for item in raw_infos:
+                    if isinstance(item, str):
+                        try:
+                            parsed_infos.append(json.loads(item))
+                        except Exception:
+                            parsed_infos.append(item)
+                    else:
+                        parsed_infos.append(item)
                 ws_msg = {
                     "type": "jsonapi/sendtxbatch",
                     "data": {
                         "id": str(rid),
                         "tx_types": request["tx_types"],
-                        "tx_infos": request["tx_infos"],
+                        "tx_infos": parsed_infos,
                     }
                 }
             else:
@@ -412,3 +429,20 @@ class Exchange:
             return matched
 
         return rows
+
+    async def fetch_next_nonce(self, account_index: int, api_key_index: int) -> Optional[int]:
+        """Fetch current active nonce from Robinhood Lighter GET /api/v1/nextNonce."""
+        def _get():
+            url = f"{self.rest}/api/v1/nextNonce?account_index={account_index}&api_key_index={api_key_index}"
+            req = urllib.request.Request(url, headers={"accept": "application/json", "User-Agent": "LighterBot/1.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    data = json.loads(r.read())
+                    if isinstance(data, dict):
+                        n = data.get("nonce") if data.get("nonce") is not None else data.get("next_nonce")
+                        return int(n) if n is not None else None
+                    return None
+            except Exception as e:
+                log.debug("GET nextNonce note: %s", e)
+                return None
+        return await asyncio.to_thread(_get)

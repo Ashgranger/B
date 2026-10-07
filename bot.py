@@ -757,6 +757,16 @@ class MarketMaker:
                 log.error("websockets package not available; install via pip install websockets")
                 return
 
+        # Synchronize nonce with Robinhood Lighter
+        if not self.cfg.dry_run:
+            try:
+                cur_nonce = await self.ex.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
+                if cur_nonce is not None and cur_nonce >= 0:
+                    self.signer.set_nonce(cur_nonce)
+                    log.info("Synchronized nonce with exchange: %d", cur_nonce)
+            except Exception as e:
+                log.debug("Nonce sync note: %s", e)
+
         if self.cfg.enable_cross_exchange and self.cfg.cross_feed and self._cross_feeds is None:
             self._cross_feeds = CrossFeedManager(self.cfg, self)
             self._cross_feeds.start()

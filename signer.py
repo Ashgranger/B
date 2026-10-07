@@ -1,5 +1,18 @@
-"""Request signing and transaction construction per Lighter Perpetual DEX & Robinhood Chain docs."""
 from __future__ import annotations
+
+def _unpack_sign_result(res: Any) -> tuple[Optional[int], Any, Optional[str]]:
+    """Safely unpack result from lighter SDK sign_* methods (supports 2, 3, or 4 item returns)."""
+    if isinstance(res, (tuple, list)):
+        if len(res) >= 4:
+            return res[0], res[1], res[3]
+        elif len(res) == 3:
+            return res[0], res[1], res[2]
+        elif len(res) == 2:
+            return None, res[0], res[1]
+    return None, None, f"Unexpected return type from signer: {type(res)}"
+
+"""Request signing and transaction construction per Lighter Perpetual DEX & Robinhood Chain docs."""
+
 
 import hashlib
 import hmac
@@ -233,19 +246,20 @@ class Signer:
         # Delegate to native Lighter SDK signer if available
         if self._lighter_client is not None:
             try:
-                tx_type, tx_info, err = self._lighter_client.sign_create_order(
+                sign_res = self._lighter_client.sign_create_order(
                     market_index=m.market_id,
                     client_order_index=c_order_idx,
                     base_amount=int_base_amount,
                     price=int_price,
-                    is_ask=(1 if is_ask else 0),
+                    is_ask=bool(is_ask),
                     order_type=order_type,
                     time_in_force=tif_code,
-                    reduce_only=(1 if reduce_only else 0),
+                    reduce_only=bool(reduce_only),
                     order_expiry=order_expiry,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
                 )
+                tx_type, tx_info, err = _unpack_sign_result(sign_res)
                 if not err and tx_info:
                     return {
                         "type": "placeOrder",
@@ -332,7 +346,7 @@ class Signer:
 
         if self._lighter_client is not None:
             try:
-                tx_type, tx_info, err = self._lighter_client.sign_modify_order(
+                sign_res = self._lighter_client.sign_modify_order(
                     market_index=m.market_id,
                     order_index=c_order_idx,
                     base_amount=int_base_amount,
@@ -341,6 +355,7 @@ class Signer:
                     nonce=nonce,
                     api_key_index=self.api_key_index,
                 )
+                tx_type, tx_info, err = _unpack_sign_result(sign_res)
                 if not err and tx_info:
                     return {
                         "type": "modifyOrder",
@@ -407,12 +422,13 @@ class Signer:
 
         if self._lighter_client is not None:
             try:
-                tx_type, tx_info, err = self._lighter_client.sign_cancel_order(
+                sign_res = self._lighter_client.sign_cancel_order(
                     market_index=m.market_id,
                     order_index=c_order_idx,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
                 )
+                tx_type, tx_info, err = _unpack_sign_result(sign_res)
                 if not err and tx_info:
                     return {
                         "type": "cancelOrder",
@@ -475,13 +491,14 @@ class Signer:
 
         if self._lighter_client is not None:
             try:
-                tx_type, tx_info, err = self._lighter_client.sign_cancel_all_orders(
+                sign_res = self._lighter_client.sign_cancel_all_orders(
                     time_in_force=tif,
                     timestamp_ms=expiry_ms,
                     cancel_all_market_index=m.market_id,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
                 )
+                tx_type, tx_info, err = _unpack_sign_result(sign_res)
                 if not err and tx_info:
                     return {
                         "type": "scheduleCancel",
@@ -535,13 +552,14 @@ class Signer:
         tif = CANCEL_ALL_IMMEDIATE if immediate else CANCEL_ALL_SCHEDULED
         if self._lighter_client is not None:
             try:
-                tx_type, tx_info, err = self._lighter_client.sign_cancel_all_orders(
+                sign_res = self._lighter_client.sign_cancel_all_orders(
                     time_in_force=tif,
                     timestamp_ms=0,
                     cancel_all_market_index=m.market_id,
                     nonce=nonce,
                     api_key_index=self.api_key_index,
                 )
+                tx_type, tx_info, err = _unpack_sign_result(sign_res)
                 if not err and tx_info:
                     return {
                         "type": "cancelAllOrders",
