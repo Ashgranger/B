@@ -71,17 +71,6 @@ class ConditionalMarkoutModel:
         w = Decimal(str(n)) / (Decimal(str(n)) + Decimal(str(self.prior_weight)))
         return w * sample_mean + (Decimal("1") - w) * prior
 
-MODULE_PARAMS: dict[str, set[str]] = {
-    'inventory': {'skew_bps', 'gamma_risk_aversion', 'exit_min_profit_bps', 'stress_loss_bps', 'max_hold_s'},
-    'execution': {'requote_bps', 'retreat_bps', 'min_requote_s'},
-    'pricing': {'min_edge_bps', 'max_edge_bps', 'vol_k', 'tox_mult', 'min_ev_bps'},
-    'orderbook_intel': {'obi_alpha', 'tfi_beta', 'fill_prob_kappa'},
-    'ladder': {'extra_levels', 'level_spacing_bps', 'level_size_mult'},
-    'regimes': {'regime_vol_threshold_bps', 'regime_flow_threshold', 'regime_toxic_threshold_bps', 'regime_toxic_spread_mult'},
-    'guards': {'trend_pull_bps', 'trend_widen', 'burst_fills', 'burst_cooldown_s', 'sweep_guard_fills'},
-    'cross_exchange': {'cross_lead_lag_weight', 'cross_dispersion_widen_mult', 'cross_velocity_threshold_bps'}
-}
-
 class OnlineLearner:
     """Level 7+ Autonomous Online Learning Engine.
     Dynamically modulates ALL market making environment parameters, microstructural
@@ -91,8 +80,6 @@ class OnlineLearner:
         self.cfg = cfg
         self.enabled = bool(getattr(cfg, "enable_online_learning", False))
         self.state_path = getattr(cfg, "learning_state_path", "learning_state.json")
-        self.disabled_modules = set(getattr(cfg, 'learner_disabled_modules', set()))
-        self.disabled_params = set(getattr(cfg, 'learner_disabled_params', set()))
 
         # Base configuration defaults (loaded from environment)
         self.base = {
@@ -143,8 +130,8 @@ class OnlineLearner:
             "trend_pull_bps": (Decimal("0.5"), Decimal("10.0")),
             "trend_widen": (Decimal("0.2"), Decimal("4.0")),
             "exit_min_profit_bps": (Decimal("0.5"), Decimal("10.0")),
-            "stress_loss_bps": (Decimal("10.0"), Decimal("60.0")),
-            "max_hold_s": (Decimal("60.0"), Decimal("1200.0")),
+            "stress_loss_bps": (min(Decimal("10.0"), self.base["stress_loss_bps"]), max(Decimal("60.0"), self.base["stress_loss_bps"])),
+            "max_hold_s": (min(Decimal("60.0"), self.base["max_hold_s"]), max(Decimal("1200.0"), self.base["max_hold_s"])),
             "burst_fills": (Decimal("2"), Decimal("5")),
             "burst_cooldown_s": (Decimal("10.0"), Decimal("90.0")),
             "sweep_guard_fills": (Decimal("2"), Decimal("4")),
@@ -169,39 +156,6 @@ class OnlineLearner:
             self.load()
 
     # --- Property Accessors for Engine & Bot --- #
-    def disable_module(self, module_name: str) -> None:
-        self.disabled_modules.add(module_name.strip().lower())
-
-    def enable_module(self, module_name: str) -> None:
-        self.disabled_modules.discard(module_name.strip().lower())
-
-    def disable_param(self, param_name: str) -> None:
-        self.disabled_params.add(param_name.strip().lower())
-
-    def enable_param(self, param_name: str) -> None:
-        self.disabled_params.discard(param_name.strip().lower())
-
-    def is_param_enabled(self, param_name: str) -> bool:
-        if not self.enabled or param_name == 'max_actions_per_min' or param_name in self.disabled_params:
-            return False
-        for mod, params in MODULE_PARAMS.items():
-            if param_name in params and mod in self.disabled_modules:
-                return False
-        return True
-
-    def get_access_status(self) -> dict:
-        status = {}
-        for mod, params in MODULE_PARAMS.items():
-            is_mod_off = mod in self.disabled_modules
-            p_status = {p: self.is_param_enabled(p) for p in params}
-            status[mod] = {'module_enabled': not is_mod_off, 'parameters': p_status}
-        return {
-            'online_learning_enabled': self.enabled,
-            'disabled_modules': list(self.disabled_modules),
-            'disabled_params': list(self.disabled_params),
-            'modules': status,
-        }
-
     @property
     def min_edge_bps(self) -> Decimal:
         return self.params["min_edge_bps"] if self.enabled else self.base["min_edge_bps"]
@@ -447,7 +401,7 @@ class OnlineLearner:
         self._clamp_all()
         ctx = {f"markout_{h_str}": f"{float(m_bps):+.2f}bps"}
         self._log_param_diff(reason, old_params, ctx)
-        self.save()
+        self.save_soon()
 
 
     def predict_markout(self, side: str, regime: str, level: int = 0, horizon: float = 2.0) -> Decimal:
@@ -493,7 +447,7 @@ class OnlineLearner:
 
         self._clamp_all()
         self._log_param_diff(reason, old_params, ctx)
-        self.save()
+        self.save_soon()
 
     def on_flow_correlation(self, obi: Decimal, tfi: Decimal, ret_bps: Decimal) -> None:
         """Adapts order-book and trade-flow imbalance weights based on forward price prediction accuracy."""
@@ -536,7 +490,7 @@ class OnlineLearner:
             reason = "turnover_healthy_margin"
         self._clamp_all()
         self._log_param_diff(reason, old_params, {"realized_bps": f"{float(realized_bps):.2f}"})
-        self.save()
+        self.save_soon()
 
     def get_summary(self) -> Dict[str, Any]:
         return {
@@ -551,6 +505,24 @@ class OnlineLearner:
             "last_change_reason": self.last_change_reason,
             "params": {k: f"{v:.4f}" for k, v in self.params.items()},
         }
+
+    save_interval: float = 0.0  # 0 = save immediately (default); bot sets >0 for live trading
+
+    def save_soon(self, interval: Optional[float] = None) -> None:
+        """Throttled save: never blocks the hot path more than once per `interval`."""
+        if interval is None:
+            interval = self.save_interval
+        t = time.monotonic()
+        if t - getattr(self, "_last_save_t", 0.0) >= interval:
+            self._last_save_t = t
+            self._save_dirty = False
+            self.save()
+        else:
+            self._save_dirty = True
+
+    def flush(self) -> None:
+        if getattr(self, "_save_dirty", False):
+            self.save_soon()
 
     def save(self, path: Optional[str] = None) -> bool:
         """Persists learned parameters atomically to disk."""
@@ -650,10 +622,6 @@ class Ledger:
         self.learner = OnlineLearner(cfg)
         self.learner.ledger = self
 
-    @property
-    def bayesian_model(self) -> ConditionalMarkoutModel:
-        return self.learner.markout_model
-
     def is_flat(self, mid: Decimal, min_notional: Decimal) -> bool:
         return abs(self.position * mid) < max(min_notional, Decimal(1))
 
@@ -743,9 +711,19 @@ class Ledger:
     def _calc_weighted_markout(self, buf: deque) -> Decimal:
         if not buf:
             return ZERO
+        now = self._now()
+        memo = self.__dict__.setdefault("_wm_memo", {})
+        last = buf[-1]
+        hit = memo.get(id(buf))
+        if hit is not None and hit[0] == now and hit[1] == len(buf) and hit[2] is last:
+            return hit[3]
+        res = self._calc_weighted_markout_raw(buf, now)
+        memo[id(buf)] = (now, len(buf), last, res)
+        return res
+
+    def _calc_weighted_markout_raw(self, buf: deque, now: float) -> Decimal:
         weighted_sum = ZERO
         weight_total = ZERO
-        now = self._now()
         for item in buf:
             if isinstance(item, tuple):
                 ts, val = item
@@ -783,6 +761,12 @@ class Ledger:
                 self.markouts_5s.append((now, m_bps))
                 self.latest_markout_5s = m_bps
 
+            cb = getattr(self, "on_markout_cb", None)
+            if cb is not None:
+                try:
+                    cb(f, horizon, m_bps)
+                except Exception:
+                    pass
             self.markouts.append((now, m_bps))
             if f.side == BUY:
                 self.markouts_buy.append((now, m_bps))
@@ -797,6 +781,12 @@ class Ledger:
                 self.learner.on_markout(m_bps, f.side, self.tox_bps, horizon=horizon, now=now, regime=regime)
             else:
                 self.learner.markout_model.record(f.side, regime, 0, horizon, float(m_bps))
+
+    @staticmethod
+    def raw_mean_bps(buf) -> Decimal:
+        """Plain mean of the last stored markouts (no 60s decay, so it never reads 0 when idle)."""
+        vals = [(it[1] if isinstance(it, tuple) else it) for it in buf]
+        return (sum(vals, ZERO) / Decimal(len(vals))) if vals else ZERO
 
     @property
     def avg_markout_1s_bps(self) -> Decimal:

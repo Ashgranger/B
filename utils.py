@@ -1,95 +1,86 @@
-"""Utility constants, math functions, and serialization helpers for Robinhood Lighter MM Bot."""
+"""Small shared helpers (decimal maths, canonical JSON, logging)."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import sys
-from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, ROUND_UP
-from typing import Any, Dict, List, Optional, Tuple, Union
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from typing import Any
 
-# Side Constants
-BUY = "BUY"
-SELL = "SELL"
-
-# Numerical Constants
 BPS = Decimal("10000")
 ZERO = Decimal("0")
 ONE = Decimal("1")
-TWO = Decimal("2")
+BUY, SELL = "BUY", "SELL"
 
 
 class Fatal(Exception):
-    """Unrecoverable fatal error requiring bot halt."""
-    pass
+    """Unrecoverable config / market problem - do not reconnect."""
 
 
-class ExchangeError(Exception):
-    """Recoverable exchange protocol or communication error."""
-    pass
+def q_down(x: Decimal, unit: Decimal) -> Decimal:
+    if unit <= ZERO:
+        return x
+    return (x / unit).to_integral_value(rounding=ROUND_DOWN) * unit
 
 
-class SigningError(Exception):
-    """Cryptographic signing or verification error."""
-    pass
+def q_up(x: Decimal, unit: Decimal) -> Decimal:
+    if unit <= ZERO:
+        return x
+    return (x / unit).to_integral_value(rounding=ROUND_UP) * unit
 
 
-def setup_logging(level_name: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level_name.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
+def to_int(value: Decimal, unit: Decimal) -> int:
+    """Exact decimal -> integer ticks/quantums."""
+    n = value / unit
+    rounded = round(n)
+    if abs(n - rounded) < Decimal("0.00001"):
+        return int(rounded)
+    if n != n.to_integral_value():
+        raise ValueError(f"{value} is not a multiple of {unit}")
+    return int(n)
 
 
-def fmt(val: Optional[Union[Decimal, float]]) -> str:
-    """Format decimal or float cleanly without trailing exponential noise."""
-    if val is None:
-        return "None"
-    d = Decimal(str(val)) if not isinstance(val, Decimal) else val
-    s = f"{d:f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s if s else "0"
+def to_lighter_int(value: Decimal, decimals: int) -> int:
+    """Convert a Decimal value to integer scaling using base 10^decimals for Lighter."""
+    multiplier = Decimal(10 ** decimals)
+    return int((value * multiplier).to_integral_value(rounding=ROUND_DOWN))
 
 
-def to_int(val: Any, step_or_tick: Decimal) -> int:
-    """Convert a float/Decimal value to an integer scaled by tick_size or step_size."""
-    d = Decimal(str(val))
-    scaled = d / step_or_tick
-    return int(scaled.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+def from_lighter_int(value: int, decimals: int) -> Decimal:
+    """Convert an integer scaled by 10^decimals back to Decimal."""
+    return Decimal(value) / Decimal(10 ** decimals)
 
 
-def clamp(val: Decimal, low: Decimal, high: Decimal) -> Decimal:
-    """Clamp decimal within bounds."""
-    if low > high:
-        low, high = high, low
-    return max(low, min(val, high))
-
-
-def bps_diff(p1: Decimal, p2: Decimal) -> Decimal:
-    """Relative basis points difference (p1 - p2) / p2 * 10,000."""
-    if p2 == ZERO:
-        return ZERO
-    return ((p1 - p2) / p2) * BPS
-
-
-def q_down(val: Decimal, step: Decimal) -> Decimal:
-    """Quantize downward to nearest step."""
-    if step <= ZERO:
-        return val
-    return (val / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
-
-
-def q_up(val: Decimal, step: Decimal) -> Decimal:
-    """Quantize upward to nearest step."""
-    if step <= ZERO:
-        return val
-    return (val / step).quantize(Decimal("1"), rounding=ROUND_UP) * step
+def fmt(d: Decimal) -> str:
+    return format(d.normalize(), "f")
 
 
 def canonical(obj: Any) -> str:
-    """Deterministic JSON string for hashing and signing verification."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+def clamp(x: Decimal, lo: Decimal, hi: Decimal) -> Decimal:
+    return max(lo, min(hi, x))
+
+
+def bps_diff(a: Decimal, b: Decimal) -> Decimal:
+    """(a - b) / b in basis points."""
+    return (a - b) / b * BPS if b else ZERO
+
+
+def setup_logging(level: str = "INFO") -> None:
+    """Dated timestamps (multi-day runs) + optional size-rotated file via LOG_FILE / LOG_MAX_MB / LOG_BACKUPS."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    handlers = [logging.StreamHandler()]
+    path = os.getenv("LOG_FILE", "").strip()
+    if path:
+        mb = float(os.getenv("LOG_MAX_MB", "20"))
+        handlers.append(RotatingFileHandler(path, maxBytes=int(mb * 1024 * 1024),
+                                            backupCount=int(os.getenv("LOG_BACKUPS", "10")), encoding="utf-8"))
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )

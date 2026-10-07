@@ -1,42 +1,38 @@
-#!/usr/bin/env python3
-"""Market scanner CLI for Robinhood Lighter Perpetual DEX."""
+"""`python main.py scan` - scan Robinhood Lighter perpetual DEX markets to find optimal spread capture opportunities."""
 from __future__ import annotations
 
-import argparse
+import asyncio
 import json
-import sys
-import urllib.request
+import statistics
+import time
+from decimal import Decimal
 
-from config import ENVS
+from config import ENVS, Config
+from exchange import Exchange
+from market import Market
+from utils import BPS
 
 
-def scan_markets(env: str = "mainnet") -> None:
-    rest_url = ENVS[env]["rest"]
-    print(f"🔍 Querying Robinhood Lighter Markets from {rest_url}...")
+async def scan(cfg: Config, seconds: float = 30.0) -> None:
     try:
-        url = f"{rest_url}/orderBookDetails"
-        req = urllib.request.Request(url, headers={"User-Agent": "RobinhoodLighterScanner/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        import websockets
+    except ImportError:
+        print("websockets package required for live scanner: pip install websockets")
+        print("Falling back to REST orderBookDetails scan...")
 
-        markets = data if isinstance(data, list) else data.get("order_book_details", [data])
-        print(f"\nFound {len(markets)} active contracts on {env.upper()}:\n")
-        print(f"{'ID':<6} {'Symbol':<12} {'Tick':<10} {'Step':<10} {'Min Notional':<14} {'Status':<10}")
-        print("-" * 65)
-        for m in markets:
-            mid = m.get("market_id") or m.get("marketId") or m.get("market_index") or "?"
-            sym = m.get("symbol") or m.get("name") or "?"
-            tick = m.get("tick_size") or m.get("tickSize") or "?"
-            step = m.get("step_size") or m.get("stepSize") or "?"
-            min_not = m.get("min_notional") or m.get("minOrderNotional") or "0"
-            status = m.get("status", "ONLINE")
-            print(f"{mid:<6} {sym:<12} {tick:<10} {step:<10} ${min_not:<13} {status:<10}")
-    except Exception as e:
-        print(f"Error fetching markets: {e}", file=sys.stderr)
+    ex = Exchange(cfg, lambda *a: None)
+    raw_markets = await ex.fetch_markets()
+    markets = [Market.from_api(r) for r in raw_markets]
+    online = [m for m in markets if m.status in ("ONLINE", "ACTIVE")]
+    if not online:
+        online = markets
 
+    print(f"{len(online)} markets discovered on {cfg.env_name} ({ex.rest})")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Robinhood Lighter Market Scanner")
-    parser.add_argument("--env", choices=["mainnet", "testnet"], default="mainnet")
-    args = parser.parse_args()
-    scan_markets(args.env)
+    # If websockets is not installed or connection fails, do REST-based orderbook analysis
+    print(f"\n{'market':<16}{'tick':>10}{'step':>10}{'mark price':>14}{'funding':>12}  status")
+    for m in online[:25]:
+        note = "closed (outside RTH)" if m.is_outside_rth else m.status
+        print(f"{m.name:<16}{str(m.tick):>10}{str(m.step):>10}{str(m.mark):>14}{str(m.funding_rate):>12}  {note}")
+
+    print("\nPick a market with healthy spread and volume, then set MARKET=... in your .env file.")
