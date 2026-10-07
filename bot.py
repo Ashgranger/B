@@ -589,6 +589,11 @@ class MarketMaker:
                 return
             self._dms_fail += 1
             err_txt = json.dumps(resp.get("error") if isinstance(resp, dict) else resp).lower()
+            if "invalid signature" in err_txt or (isinstance(resp, dict) and resp.get("code") == 21120):
+                log.warning("scheduleCancel not supported on Robinhood Lighter; disabling DMS")
+                self.cfg.dms_enabled = False
+                await self.om._resync_nonce()
+                return
             if "limit reached" in err_txt or "daily_limit" in err_txt or "trigger limit" in err_txt:
                 wall = time.time()
                 self._dms_blocked_until = (int(wall // 86400) + 1) * 86400.0 + 5.0
@@ -814,10 +819,12 @@ class MarketMaker:
 
                     reconnect_delay = 1.0
                     self._last_heartbeat = 0.0
-                    await self._heartbeat(self.now())  # arm before any quote is placed
 
-                    if self.om.maybe_orders:
+                    if self.om.maybe_orders and not self.cfg.dry_run:
                         await self.om.cancel_all()
+
+                    if self.cfg.dms_enabled:
+                        await self._heartbeat(self.now())
 
                     log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 

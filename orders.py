@@ -61,6 +61,16 @@ class OrderManager:
         self.maybe_orders = True
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
+    async def _resync_nonce(self) -> None:
+        try:
+            n = await self.ex.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
+            if n is not None and n >= 0:
+                self.signer.set_nonce(n)
+                log.info("Auto-resynchronized nonce with exchange: %d", n)
+                self._consec_errors = 0
+        except Exception as e:
+            log.debug("Auto-resync nonce note: %s", e)
+
     def side_orders(self, side: str) -> list[Order]:
         return sorted((o for o in self.orders.values() if o.side == side), key=lambda o: o.price, reverse=(side == BUY))
 
@@ -144,6 +154,10 @@ class OrderManager:
         if not self._ok(resp) or str(res.get("status", "")).upper() == "REJECTED":
             self._error(f"place L{pair_index} {side}", resp if not self._ok(resp) else
                         {"status": code, "error": res}, now)
+            err_code = resp.get("code") if isinstance(resp, dict) else (res.get("code") if isinstance(res, dict) else None)
+            err_msg = str(resp).lower()
+            if err_code == 21104 or "invalid nonce" in err_msg:
+                await self._resync_nonce()
             if not is_taker:
                 self._backoff(side, now)
             return None
@@ -183,6 +197,10 @@ class OrderManager:
         resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
+            err_code = resp.get("code") if isinstance(resp, dict) else None
+            err_msg = str(resp).lower()
+            if err_code == 21104 or "invalid nonce" in err_msg:
+                await self._resync_nonce()
             await self.cancel(o, now)
             return False
         self._consec_errors = 0
