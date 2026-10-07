@@ -324,10 +324,10 @@ class OrderManager:
 
         m = self.get_market()
         tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
-        eff_retreat = min(self.cfg.retreat_bps, tick_bps * Decimal("0.9"))
-        eff_requote = min(self.cfg.requote_bps, tick_bps * Decimal("0.9"))
+        eff_retreat = max(self.cfg.retreat_bps, tick_bps)
+        eff_requote = max(self.cfg.requote_bps, tick_bps)
 
-        if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
+        if is_retreating and (drift >= eff_retreat or (drift >= tick_bps and (now - existing.last_action >= 1.0))):
             should_modify = True
             urgent = True
         elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
