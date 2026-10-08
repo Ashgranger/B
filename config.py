@@ -1,4 +1,4 @@
-"""All tunables live here (loaded from environment / .env) for Robinhood Lighter Perpetual DEX."""
+"""All tunables live here (loaded from environment / .env)."""
 from __future__ import annotations
 
 import os
@@ -9,10 +9,8 @@ from decimal import Decimal
 from utils import Fatal
 
 ENVS = {
-    "rh_mainnet": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream", "chain_id": 4663},
-    "robinhood": {"rest": "https://api.rh.lighter.xyz", "ws": "wss://api.rh.lighter.xyz/stream", "chain_id": 4663},
-    "mainnet": {"rest": "https://mainnet.zklighter.elliot.ai", "ws": "wss://mainnet.zklighter.elliot.ai/stream", "chain_id": 304},
-    "testnet": {"rest": "https://testnet.zklighter.elliot.ai", "ws": "wss://testnet.zklighter.elliot.ai/stream", "chain_id": 304},
+    "mainnet": {"rest": "https://api.arcus.xyz", "ws": "wss://api.arcus.xyz/v1/ws"},
+    "testnet": {"rest": "https://api.testnet.arcus.xyz", "ws": "wss://api.testnet.arcus.xyz/v1/ws"},
 }
 
 
@@ -21,20 +19,13 @@ def _e(name: str, default):
     return default if v is None or v.strip() == "" else v.strip()
 
 
-def _get_env_any(*names, default=""):
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and v.strip() != "":
-            return v.strip()
-    return default
-
-
 def _d(name: str, default: str) -> Decimal:
     return Decimal(str(_e(name, default)))
 
 
 def _b(name: str, default: str) -> bool:
     return str(_e(name, default)).lower() in ("1", "true", "yes", "y", "on")
+
 
 
 def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Decimal]:
@@ -51,7 +42,6 @@ def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Deci
     if s in ("1", "true", "yes", "on"):
         return True, Decimal("0.5")
     return False, Decimal("0")
-
 
 def _parse_weights(raw: str) -> dict:
     out = {}
@@ -72,8 +62,6 @@ class Config:
     address: str
     signing_key: str
     account_index: int
-    api_key_index: int
-    chain_id: int
     market: str
     dry_run: bool
 
@@ -118,7 +106,7 @@ class Config:
     markout_horizon_s: float
     markout_window: int
 
-    # --- Quantitative Models ----------------------------------------------- #
+    # --- Level 4 - 7 Quantitative Models ----------------------------------- #
     min_ev_bps: Decimal
     enable_adaptive_ev: bool
     enable_orderbook_intel: bool
@@ -158,6 +146,11 @@ class Config:
     adv_obi_exit: bool
     exclude_own_orders: bool
     market_refresh_s: float
+    enable_taker_exits: bool
+    maker_exit_first: bool
+    maker_exit_slack_bps: Decimal
+    maker_exit_min_prob: float
+    taker_hard_stop_bps: Decimal
     oracle_guard: bool
     oracle_guard_bps: Decimal
     enable_dynamic_sizing: bool
@@ -180,7 +173,7 @@ class Config:
     emergency_taker_loss_bps: Decimal
     emergency_taker_score_threshold: Decimal
 
-    # --- Tight-Spread & Queue-Aware Models --------------------------------- #
+    # --- Level 8 Tight-Spread & Queue-Aware Models ------------------------- #
     enable_selective_touch: bool
     enable_queue_model: bool
     queue_horizon_s: float
@@ -240,72 +233,23 @@ class Config:
     cross_div_adverse_mult: float = 1.0
     cross_flow_weight: float = 0.3
 
-    @property
-    def api_key(self) -> str:
-        return self.signing_key
-
-    @property
-    def private_key(self) -> str:
-        return self.signing_key
-
-    @property
-    def l1_address(self) -> str:
-        return self.address
-
-    @property
-    def wallet_address(self) -> str:
-        return self.address
-
     @classmethod
     def from_env(cls) -> "Config":
-        raw_env = _get_env_any("ROBINHOOD_LIGHTER_ENV", "LIGHTER_ENV", "ARCUS_ENV", default="rh_mainnet").lower()
-        if raw_env in ("robinhood", "rh", "robinhood_mainnet", "rh_mainnet"):
-            env_name = "rh_mainnet"
-        elif raw_env in ("mainnet", "lighter_mainnet"):
-            env_name = "mainnet"
-        elif raw_env in ("testnet", "lighter_testnet"):
-            env_name = "testnet"
-        elif raw_env in ENVS:
-            env_name = raw_env
-        else:
-            raise Fatal(f"Environment '{raw_env}' must be one of {list(ENVS.keys())}")
-
-        address = _get_env_any("ROBINHOOD_WALLET_ADDRESS", "LIGHTER_L1_ADDRESS", "ARCUS_WALLET_ADDRESS", default="")
+        env_name = str(_e("ARCUS_ENV", "testnet")).lower()
+        if env_name not in ENVS:
+            raise Fatal(f"ARCUS_ENV must be one of {list(ENVS)}")
+        address = str(_e("ARCUS_WALLET_ADDRESS", ""))
         if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
-            raise Fatal("Wallet address must be a valid 0x 20-byte Ethereum / Robinhood Chain address")
-
-        raw_key = _get_env_any(
-            "ROBINHOOD_API_PRIVATE_KEY", "LIGHTER_API_KEY", "LIGHTER_API_PRIVATE_KEY", "ARCUS_API_SIGNING_KEY", default=""
-        )
-        # Clean quotes, whitespace, and 0x prefix
-        key = re.sub(r"\s+", "", raw_key.strip().strip("'\""))
-        if key.lower().startswith("0x"):
-            key = key[2:]
-
-        # Accept 80-character (40 bytes, native Robinhood Lighter key), 64-character (32 bytes), or valid hex string
-        if not re.fullmatch(r"[0-9a-fA-F]{32,128}", key):
-            raise Fatal(f"API Signing Key must be a valid hex private key (received length {len(key)}, expected 80-hex for Robinhood Lighter or 64-hex)")
-
+            raise Fatal("ARCUS_WALLET_ADDRESS must be your 0x master wallet address")
+        key = str(_e("ARCUS_API_SIGNING_KEY", "")).removeprefix("0x")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
+            raise Fatal("ARCUS_API_SIGNING_KEY must be the 64-hex Ed25519 private key")
         dry = _b("DRY_RUN", "1")
         market = str(_e("MARKET", "BTC-USD"))
         guar_sc, guar_sc_bps = _parse_guarantee_spread_capture("GUARANTEE_SPREAD_CAPTURE", "1")
-
-        account_index = int(_get_env_any("ROBINHOOD_ACCOUNT_INDEX", "LIGHTER_ACCOUNT_INDEX", "ACCOUNT_INDEX", "ARCUS_ACCOUNT_INDEX", default="0"))
-        api_key_index = int(_get_env_any("ROBINHOOD_API_KEY_INDEX", "LIGHTER_API_KEY_INDEX", "API_KEY_INDEX", default="4"))
-
-        # Chain ID: 4663 for Robinhood Chain Mainnet, 304 for Lighter Mainnet
-        default_chain_id = ENVS[env_name].get("chain_id", 4663)
-        chain_id = int(_get_env_any("ROBINHOOD_CHAIN_ID", "LIGHTER_CHAIN_ID", "CHAIN_ID", default=str(default_chain_id)))
-
         cfg = cls(
-            env_name=env_name,
-            address=address,
-            signing_key=key,
-            account_index=account_index,
-            api_key_index=api_key_index,
-            chain_id=chain_id,
-            market=market,
-            dry_run=dry,
+            env_name=env_name, address=address, signing_key=key,
+            account_index=int(_e("ARCUS_ACCOUNT_INDEX", 0)), market=market, dry_run=dry,
             order_usd=_d("ORDER_USD", "30"),
             max_position_usd=_d("MAX_POSITION_USD", "60"),
             skew_bps=_d("SKEW_BPS", "3"),
@@ -372,6 +316,11 @@ class Config:
             adv_obi_exit=_b("ADV_OBI_EXIT", "0"),
             exclude_own_orders=_b("EXCLUDE_OWN_ORDERS", "0"),
             market_refresh_s=float(_e("MARKET_REFRESH_S", "5")),
+            enable_taker_exits=_b("ENABLE_TAKER_EXITS", "1"),
+            maker_exit_first=_b("MAKER_EXIT_FIRST", "0"),
+            maker_exit_slack_bps=_d("MAKER_EXIT_SLACK_BPS", "2.0"),
+            maker_exit_min_prob=float(_e("MAKER_EXIT_MIN_PROB", "0.55")),
+            taker_hard_stop_bps=_d("TAKER_HARD_STOP_BPS", "0"),
             oracle_guard=_b("ORACLE_GUARD", "0"),
             oracle_guard_bps=_d("ORACLE_GUARD_BPS", "3.0"),
             enable_dynamic_sizing=_b("ENABLE_DYNAMIC_SIZING", "0"),

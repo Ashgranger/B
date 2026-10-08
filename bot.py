@@ -1,4 +1,4 @@
-"""Level 7 Market Maker for Robinhood Lighter Perpetuals."""
+"""Level 7 Market Maker for Arcus Perpetuals."""
 from __future__ import annotations
 
 import asyncio
@@ -83,8 +83,7 @@ class MarketMaker:
 
         self.ex = Exchange(cfg, self._on_channel)
         self.md = MarketData(cfg)
-        self._latest_ws_orders = []
-        self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index, cfg.api_key_index, url=self.ex.rest)
+        self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
         self.ledger = Ledger(cfg)
         self.ledger.on_markout_cb = self._journal_markout
         self.md.own_provider = self._own_resting
@@ -174,30 +173,21 @@ class MarketMaker:
                 self.om.on_update(contents, now)
             self._dirty_evt.set()
 
-        elif channel in ("positions", "account_market", "account_all"):
+        elif channel == "positions":
             rows = extract_positions(contents)
             m = self.md.info
             if m:
                 target_mid = self.md.mid or m.mark
                 for r in rows:
-                    mid_val = r.get("market_id") if r.get("market_id") is not None else r.get("marketId", -1)
-                    if int(mid_val) == m.market_id:
-                        if "position" in r:
-                            raw_pos = Decimal(str(r["position"]))
-                            sign = int(r.get("sign", 1 if raw_pos >= 0 else -1))
-                            signed_pos = abs(raw_pos) * sign
-                        else:
-                            side = str(r.get("side", "FLAT")).upper()
-                            sz = Decimal(str(r.get("size", "0")))
-                            signed_pos = sz if side == "LONG" else (-sz if side == "SHORT" else ZERO)
+                    if int(r.get("marketId", -1)) == m.market_id:
+                        side = str(r.get("side", "FLAT")).upper()
+                        sz = Decimal(str(r.get("size", "0")))
+                        signed_pos = sz if side == "LONG" else (-sz if side == "SHORT" else ZERO)
                         self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional)
 
-        elif channel in ("funding", "funding_rate", "fundingRate", "market_stats", "marketStats"):
+        elif channel in ("funding", "funding_rate", "fundingRate"):
             if isinstance(contents, dict):
-                mark_px = contents.get("mark_price") or contents.get("markPrice")
-                if mark_px and self.md.info:
-                    self.md.info.mark = Decimal(str(mark_px))
-                r = Decimal(str(contents.get("current_funding_rate") or contents.get("funding_rate") or contents.get("rate") or "0"))
+                r = Decimal(str(contents.get("rate") or contents.get("fundingRate") or "0"))
                 if self.md.info:
                     self.md.info.funding_rate = r
                 self.md.funding_rate = r
@@ -242,23 +232,6 @@ class MarketMaker:
             px = Decimal(str(tr.get("price") or "0"))
             if sz > 0:
                 self.md.on_trade(side, sz, px, now)
-
-            # Check if this trade is OUR fill on Robinhood Lighter
-            ask_acc = tr.get("ask_account_id")
-            bid_acc = tr.get("bid_account_id")
-            my_acc = self.cfg.account_index
-            if my_acc is not None and (ask_acc == my_acc or bid_acc == my_acc):
-                fill_side = SELL if ask_acc == my_acc else BUY
-                for o in list(self.om.orders.values()):
-                    if o.side == fill_side and abs(o.price - px) <= Decimal("0.05"):
-                        o.filled_any = True
-                        fill_qty = min(sz, o.remaining)
-                        o.remaining -= fill_qty
-                        log.info("OUR FILL from trade stream: %s %s @ %s (remaining: %s)", fill_side, fmt(fill_qty), fmt(px), fmt(o.remaining))
-                        self._on_fill(fill_side, fill_qty, px, o)
-                        if o.remaining <= 0:
-                            self.om._remove_order(o.order_id)
-                        break
         except Exception:
             pass
 
@@ -469,7 +442,7 @@ class MarketMaker:
 
             self._rth_unwind_only = False
             if m.is_outside_rth and not self.cfg.quote_outside_rth:
-                if self.ledger.position * mid == ZERO:
+                if abs(self.ledger.position) < m.min_size:
                     await self.om.cancel_all()
                     if now - self._last_pause_log["rth"] > 30.0:
                         self._last_pause_log["rth"] = now
@@ -589,11 +562,6 @@ class MarketMaker:
                 return
             self._dms_fail += 1
             err_txt = json.dumps(resp.get("error") if isinstance(resp, dict) else resp).lower()
-            if "invalid signature" in err_txt or (isinstance(resp, dict) and resp.get("code") == 21120):
-                log.warning("scheduleCancel not supported on Robinhood Lighter; disabling DMS")
-                self.cfg.dms_enabled = False
-                await self.om._resync_nonce()
-                return
             if "limit reached" in err_txt or "daily_limit" in err_txt or "trigger limit" in err_txt:
                 wall = time.time()
                 self._dms_blocked_until = (int(wall // 86400) + 1) * 86400.0 + 5.0
@@ -624,12 +592,17 @@ class MarketMaker:
         if self.cfg.dry_run or not self.md.info:
             return
         try:
-            await asyncio.sleep(0.2)
-            # 100% WebSocket: verify local order book is clear
-            if not self.om.orders:
+            await asyncio.sleep(0.4)
+            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                "marketId": self.md.info.market_id}, timeout=3.0)
+            rows = [r for r in (res or {}).get("openOrders", []) if isinstance(r, dict)
+                    and r.get("marketId") in (None, self.md.info.market_id)] if res is not None else None
+            if rows == []:
                 await self._disarm_dms()
+            elif rows is None:
+                log.warning("could not verify empty book on shutdown - leaving dead man's switch armed")
             else:
-                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(self.om.orders))
+                log.warning("%d order(s) still open on shutdown - leaving dead man's switch armed", len(rows))
         except Exception as e:
             log.warning("shutdown verification error: %s", e)
 
@@ -683,9 +656,10 @@ class MarketMaker:
             m = self.md.info
             if not m:
                 return
-            # 100% WebSocket: reconcile against latest open orders streamed over WS
-            if getattr(self, "_latest_ws_orders", None):
-                await self.om.reconcile(self._latest_ws_orders, now)
+            res = await self.ex.get("orders", {"address": self.cfg.address, "accountIndex": self.cfg.account_index,
+                                                "marketId": m.market_id})
+            if res and "openOrders" in res:
+                await self.om.reconcile(res["openOrders"], now)
         except Exception:
             pass
 
@@ -744,7 +718,7 @@ class MarketMaker:
     async def run(self) -> None:
         if self.cfg.enable_online_learning and hasattr(self.ledger, "learner"):
             self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
-        log.info("Connecting to %s Robinhood Lighter WS (%s)...", self.cfg.env_name, self.ex.ws_url)
+        log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
         self.md.info_ts = self.now()
@@ -762,16 +736,6 @@ class MarketMaker:
                 log.error("websockets package not available; install via pip install websockets")
                 return
 
-        # Synchronize nonce with Robinhood Lighter
-        if not self.cfg.dry_run:
-            try:
-                cur_nonce = await self.ex.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
-                if cur_nonce is not None and cur_nonce >= 0:
-                    self.signer.set_nonce(cur_nonce)
-                    log.info("Synchronized nonce with exchange: %d", cur_nonce)
-            except Exception as e:
-                log.debug("Nonce sync note: %s", e)
-
         if self.cfg.enable_cross_exchange and self.cfg.cross_feed and self._cross_feeds is None:
             self._cross_feeds = CrossFeedManager(self.cfg, self)
             self._cross_feeds.start()
@@ -782,7 +746,7 @@ class MarketMaker:
         while not self.stop_evt.is_set():
             reader_task = None
             try:
-                log.info("Connecting to Robinhood Lighter WebSocket (%s)...", self.ex.ws_url)
+                log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
                 async with websockets.connect(
                     self.ex.ws_url,
                     ping_interval=15,
@@ -794,37 +758,19 @@ class MarketMaker:
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
 
-                    # Robinhood Lighter Channels
-                    mkt_id = self.md.info.market_id if self.md.info else 0
-                    await self.ex.subscribe(f"order_book/{mkt_id}")
-                    await self.ex.subscribe(f"ticker/{mkt_id}")
-                    await self.ex.subscribe(f"trade/{mkt_id}")
-                    await self.ex.subscribe(f"market_stats/{mkt_id}")
-                    try:
-                        auth_tok = self.signer.create_auth_token(14400)
-                        await self.ex.subscribe(f"account_orders/{mkt_id}/{self.cfg.account_index}", auth=auth_tok)
-                        await self.ex.subscribe(f"account_market/{mkt_id}/{self.cfg.account_index}", auth=auth_tok)
-                        await self.ex.subscribe(f"user_stats/{self.cfg.account_index}")
-                    except Exception as e:
-                        log.debug("Private stream auth note: %s", e)
-
-                    # Simulator-only channel compatibility (never send to live Lighter WebSocket)
-                    if hasattr(self.ex.ws, "_post") or getattr(self.ex, "is_sim", False):
-                        await self.ex.subscribe("bbo", self.cfg.market)
-                        await self.ex.subscribe("l2Orderbook", self.cfg.market)
-                        await self.ex.subscribe("trades", self.cfg.market)
-                        await self.ex.subscribe("orders", self.cfg.address)
-                        await self.ex.subscribe("userFills", self.cfg.address)
-                        await self.ex.subscribe("positions", self.cfg.address)
+                    await self.ex.subscribe("bbo", self.cfg.market)
+                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
+                    await self.ex.subscribe("trades", self.cfg.market)
+                    await self.ex.subscribe("orders", self.cfg.address)
+                    await self.ex.subscribe("userFills", self.cfg.address)
+                    await self.ex.subscribe("positions", self.cfg.address)
 
                     reconnect_delay = 1.0
                     self._last_heartbeat = 0.0
+                    await self._heartbeat(self.now())  # arm before any quote is placed
 
-                    if self.om.maybe_orders and not self.cfg.dry_run:
+                    if self.om.maybe_orders:
                         await self.om.cancel_all()
-
-                    if self.cfg.dms_enabled:
-                        await self._heartbeat(self.now())
 
                     log.info("Subscribed to data feeds. Level 7 MM Engine active.")
 
@@ -879,14 +825,4 @@ class MarketMaker:
                 await self._cross_feeds.stop()
             except Exception:
                 pass
-        if hasattr(self.signer, "close"):
-            try:
-                await self.signer.close()
-            except Exception:
-                pass
         self._close_files()
-
-
-# Aliases for Robinhood Lighter
-LighterMarketMaker = MarketMaker
-__all__ = ["MarketMaker", "LighterMarketMaker", "extract_positions"]

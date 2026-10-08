@@ -1,4 +1,4 @@
-"""Robinhood Lighter perpetual DEX simulator driving the quantitative Market Maker."""
+"""Arcus exchange simulator driving the Level 7 Market Maker."""
 from __future__ import annotations
 
 import asyncio
@@ -29,14 +29,8 @@ MKT = Market(1, "BTC-USD", "ONLINE", D("0.1"), D("0.00000001"), [], D("5"), D("0
 
 def mkcfg(**env):
     base = {
-        "ROBINHOOD_LIGHTER_ENV": "testnet",
-        "LIGHTER_ENV": "testnet",
         "ARCUS_ENV": "testnet",
-        "ROBINHOOD_WALLET_ADDRESS": ADDR,
-        "LIGHTER_L1_ADDRESS": ADDR,
         "ARCUS_WALLET_ADDRESS": ADDR,
-        "ROBINHOOD_API_PRIVATE_KEY": "11" * 32,
-        "LIGHTER_API_PRIVATE_KEY": "11" * 32,
         "ARCUS_API_SIGNING_KEY": "11" * 32,
         "DRY_RUN": "0",
         "JOURNAL_PATH": os.devnull,
@@ -85,10 +79,8 @@ class SimWS:
 
     def _push(self, o, state, status, reason=None, rem=None):
         c = {
-            "orderId": o["id"], "client_order_id": o["id"], "client_order_index": o["id"],
-            "state": state, "status": status, "side": o["side"],
-            "price": fmt(o["price"]), "remainingSize": fmt(o["rem"] if rem is None else rem),
-            "remaining_base_amount": fmt(o["rem"] if rem is None else rem)
+            "orderId": o["id"], "state": state, "status": status, "side": o["side"],
+            "price": fmt(o["price"]), "remainingSize": fmt(o["rem"] if rem is None else rem)
         }
         if reason:
             c["rejectionReason" if state == "REJECTED" else "cancelReason"] = reason
@@ -99,60 +91,24 @@ class SimWS:
 
     async def send(self, raw):
         m = json.loads(raw)
-        mtype = m.get("type")
-        if mtype in ("post", "jsonapi/sendtx"):
+        if m["type"] == "post":
             self._post(m)
-        elif mtype in ("get",):
+        elif m["type"] == "get":
             self._get(m)
-        elif mtype == "ping":
-            self._reply({"type": "pong"})
 
     def _post(self, m):
-        r = m.get("request", {})
-        t = r.get("type")
-        p = r.get("payload", {})
-
-        # If data is present from Lighter jsonapi
-        if not t and "tx_type" in m.get("data", {}):
-            tx_type = m["data"]["tx_type"]
-            t = {14: "placeOrder", 17: "modifyOrder", 15: "cancelOrder", 16: "scheduleCancel"}.get(tx_type, "order")
-            tx_info = m["data"].get("tx_info", {})
-            if isinstance(tx_info, str):
-                try:
-                    tx_info = json.loads(tx_info)
-                except Exception:
-                    pass
-            p = tx_info
-
+        r = m["request"]
+        t = r["type"]
+        p = r["payload"]
         self.posts.append(t)
         if t == "placeOrder":
             self.seq += 1
-            oid = str(p.get("orderId") or p.get("clientOrderIndex") or f"sim-{self.seq}")
-            side = p.get("orderSide") or ("SELL" if p.get("IsAsk") == 1 else "BUY")
-
-            price_decimals = getattr(self.bot.md.info, "price_decimals", 2)
-            size_decimals = getattr(self.bot.md.info, "size_decimals", 4)
-
-            if "price" in p and p["price"] is not None:
-                price = D(str(p["price"]))
-            elif "Price" in p and p["Price"] is not None:
-                price = D(str(p["Price"])) / D(10**price_decimals)
-            else:
-                price = D("0")
-
-            if "quantity" in p and p["quantity"] is not None:
-                qty = D(str(p["quantity"]))
-            elif "BaseAmount" in p and p["BaseAmount"] is not None:
-                qty = D(str(p["BaseAmount"])) / D(10**size_decimals)
-            else:
-                qty = D("1")
-
-            o = {"id": oid, "side": side, "price": price, "rem": qty}
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"orderId": oid, "status": "ACK"}})
+            oid = f"sim-{self.seq}"
+            o = {"id": oid, "side": p["orderSide"], "price": D(p["price"]), "rem": D(p["quantity"])}
+            self._reply({"id": m["id"], "status": 202, "result": {"orderId": oid, "status": "ACK"}})
             if self._crosses(o["side"], o["price"]):
-                tif = str(p.get("timeInForce", "ALO")).upper()
-                is_ioc = ("IOC" in tif or "IMMEDIATE" in tif or tif == "0" or p.get("TimeInForce") == 0 or r.get("tx_info", {}).get("TimeInForce") == 0)
-                if is_ioc:
+                tif = p.get("timeInForce", "ALO")
+                if tif == "IOC":
                     q = o["rem"]
                     signed = q if o["side"] == "BUY" else -q
                     self.position += signed
@@ -169,48 +125,33 @@ class SimWS:
                 self._push(o, "OPEN", "OPEN")
                 for s in ("BUY", "SELL"):
                     self.max_open_per_side = max(self.max_open_per_side, sum(1 for x in self.orders.values() if x["side"] == s))
-
         elif t == "modifyOrder":
-            oid = str(p.get("orderId") or p.get("ClientOrderIndex"))
-            o = self.orders.get(oid)
+            o = self.orders.get(p["orderId"])
             if o is None:
                 self._reply({"id": m["id"], "status": 404, "error": {"type": "ORDER_NOT_FOUND"}})
                 return
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"status": "ACK"}})
-
-            if "price" in p and p["price"] is not None:
-                o["price"] = D(str(p["price"]))
-            elif "Price" in p and p["Price"] is not None:
-                price_decimals = getattr(self.bot.md.info, "price_decimals", 2)
-                o["price"] = D(str(p["Price"])) / D(10**price_decimals)
-
+            self._reply({"id": m["id"], "status": 202, "result": {"status": "ACK"}})
+            o["price"] = D(p["price"])
             if self._crosses(o["side"], o["price"]):
                 self.rejects += 1
                 self.orders.pop(o["id"])
                 self._push(o, "REJECTED", "REJECTED", "POST_ONLY_WOULD_CROSS")
             else:
                 self._push(o, "OPEN", "OPEN")
-
         elif t == "cancelOrder":
-            oid = str(p.get("orderId") or p.get("ClientOrderIndex"))
-            o = self.orders.pop(oid, None)
+            o = self.orders.pop(p["orderId"], None)
             if o is None:
                 self._reply({"id": m["id"], "status": 404, "error": {"type": "ORDER_NOT_FOUND"}})
                 return
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"status": "ACK"}})
+            self._reply({"id": m["id"], "status": 202, "result": {"status": "ACK"}})
             self._push(o, "CANCELED", "CANCELED", rem=o["rem"])
-
         elif t == "cancelAllOrders":
             for o in list(self.orders.values()):
                 self._push(o, "CANCELED", "CANCELED")
             self.orders.clear()
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"status": "ACK"}})
-
-        elif t == "scheduleCancel":
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"status": "ACK"}})
-
+            self._reply({"id": m["id"], "status": 202, "result": {"status": "ACK"}})
         else:
-            self._reply({"id": m["id"], "status": 202, "code": 200, "result": {"status": "ACK"}})
+            self._reply({"id": m["id"], "status": 202, "result": {"status": "ACK"}})
 
     def _get(self, m):
         t = m["request"]["type"]
