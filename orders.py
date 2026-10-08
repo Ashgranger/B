@@ -395,11 +395,12 @@ class OrderManager:
     def _apply(self, o: Order, c: dict, now: float) -> None:
         if c.get("cancelReason") == "MODIFY_CANCELED":
             return
-        state = str(c.get("state") or c.get("status") or "").upper()
-        raw_status = c.get("status")
-
-        # Map Lighter statuses (enum int or str)
-        filled = (state in ("FILLED", "3") or raw_status == 3)
+        status_raw = str(c.get("status") or c.get("state") or "").lower()
+        raw_status_num = c.get("status")
+        
+        is_canceled = status_raw.startswith("canceled") or status_raw in ("rejected", "expired") or raw_status_num in (4, 5, 6, 7, 8, 9, 10, 11, 12)
+        filled = (status_raw == "filled" or status_raw == "3" or raw_status_num == 3)
+        
         px = o.price
         try:
             if c.get("price") or c.get("p"):
@@ -413,7 +414,7 @@ class OrderManager:
         except Exception:
             pass
 
-        if o.is_taker and (filled or state == "PARTIALLY_FILLED"):
+        if o.is_taker and (filled or status_raw == "partially_filled"):
             real = any(c.get(k) and Decimal(str(c[k])) > 0
                        for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"))
             log.info("TAKER_RAW limit=%s est=%s real_px_field=%s raw=%s", fmt(o.price), fmt(o.est_px) if o.est_px else "-",
@@ -421,40 +422,67 @@ class OrderManager:
             if not real and o.est_px and getattr(self.cfg, "taker_fill_price_mode", "est") == "est":
                 px = o.est_px
 
-        fill_qty = Decimal(0)
-        rem = c.get("remaining_base_amount") or c.get("remainingSize") or c.get("rs")
-        if rem is not None:
+        m = self.get_market()
+        size_decimals = getattr(m, "size_decimals", 4) if m else 4
+        
+        cum_filled = None
+        if "filled_base_amount" in c and c["filled_base_amount"] is not None:
             try:
-                new_rem = Decimal(str(rem))
-                if new_rem < o.remaining:
-                    fill_qty = o.remaining - new_rem
-                o.remaining = new_rem
+                d_val = Decimal(str(c["filled_base_amount"]))
+                if d_val > 0 and d_val == int(d_val) and d_val > o.qty:
+                    cum_filled = d_val / (Decimal(10) ** size_decimals)
+                else:
+                    cum_filled = d_val
             except Exception:
-                rem = None
-        if filled and rem is None:
-            fill_qty, o.remaining = o.remaining, Decimal(0)
+                cum_filled = None
 
-        if fill_qty > 0:
+        fill_qty = Decimal(0)
+        if cum_filled is not None:
+            if cum_filled > getattr(o, "filled_qty", Decimal(0)):
+                fill_qty = cum_filled - getattr(o, "filled_qty", Decimal(0))
+                o.filled_qty = cum_filled
+                o.remaining = max(Decimal(0), o.qty - o.filled_qty)
+        elif filled:
+            fill_qty = o.remaining
+            o.remaining = Decimal(0)
+            o.filled_qty = o.qty
+        elif not is_canceled:
+            rem = c.get("remaining_base_amount") or c.get("remainingSize") or c.get("rs")
+            if rem is not None:
+                try:
+                    raw_rem = Decimal(str(rem))
+                    if raw_rem > 0 and raw_rem == int(raw_rem) and raw_rem > o.qty:
+                        new_rem = raw_rem / (Decimal(10) ** size_decimals)
+                    else:
+                        new_rem = raw_rem
+                    if new_rem < o.remaining:
+                        fill_qty = o.remaining - new_rem
+                        o.remaining = new_rem
+                        o.filled_qty = getattr(o, "filled_qty", Decimal(0)) + fill_qty
+                except Exception:
+                    pass
+
+        # NEVER book a fill if the order was canceled without filled base amount
+        if fill_qty > 0 and not (is_canceled and (cum_filled == Decimal(0) or cum_filled is None and not o.filled_any)):
             o.filled_any = True
+            log.info("FILL L%d %s %s @ %s (status=%s, oid=%s)", o.pair_index, o.side, fmt(fill_qty), fmt(px), status_raw, o.order_id)
             self.on_fill(o.side, fill_qty, px, o)
 
-        if state in ("OPEN", "2", "ACTIVE") or raw_status == 2:
+        if status_raw in ("open", "2", "active") or raw_status_num == 2:
             self._reject_n[o.side] = 0
 
         # IOC terminal handling per Robinhood Lighter documentation
-        is_ioc_done = o.is_taker and (state in ("PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED", "3", "4", "5", "6", "12") or
+        is_ioc_done = o.is_taker and (status_raw in ("partially_filled", "filled", "canceled", "expired", "rejected", "3", "4", "5", "6", "12") or
                                      o.remaining == Decimal(0))
-        is_canceled = (state in ("CANCELED", "REJECTED", "4", "5", "6", "7", "8", "9", "10", "11", "12") or
-                       raw_status in (4, 5, 6, 7, 8, 9, 10, 11, 12))
 
         if filled or is_ioc_done:
             self._remove_order(o.order_id)
         elif is_canceled:
-            reason = c.get("rejectionReason") or c.get("cancelReason") or c.get("ae") or ""
-            if (state in ("REJECTED", "MARGIN_CANCELED") or raw_status in (7, 8, 9, 10)) and not o.is_taker:
+            reason = c.get("rejectionReason") or c.get("cancelReason") or c.get("ae") or status_raw
+            if (status_raw in ("rejected", "margin_canceled") or raw_status_num in (7, 8, 9, 10)) and not o.is_taker:
                 self.n_reject += 1
                 self._backoff(o.side, now)
-            log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state, reason)
+            log.info("ORDER L%d %s CANCELED: %s", o.pair_index, o.side, reason)
             self._remove_order(o.order_id)
 
     async def reconcile(self, rows: list, now: float) -> None:
