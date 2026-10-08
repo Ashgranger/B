@@ -813,20 +813,24 @@ class Ledger:
         avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
 
-    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:
+    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal,
+                  force: bool = False, avg_cost: Optional[Decimal] = None) -> bool:
         tol = (min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
-        if abs(ex_pos - self.position) <= tol:
+        if not force and abs(ex_pos - self.position) <= tol:
             self._mismatch = 0
             return False
-        if now - self.last_fill_ts < 4.0:
+        if not force and now - self.last_fill_ts < 4.0:
             return False
-        self._mismatch += 1
-        if self._mismatch < 2:
-            return False
+        if not force:
+            self._mismatch += 1
+            if self._mismatch < 2:
+                return False
         old = self.position
         self.position = ex_pos
         self._mismatch = 0
-        if old == 0 or (old > 0) != (ex_pos > 0) or self.avg_cost == 0:
+        if avg_cost and avg_cost > ZERO:
+            self.avg_cost = avg_cost
+        elif old == 0 or (old > 0) != (ex_pos > 0) or self.avg_cost == 0:
             self.avg_cost = mid
-        self.opened_ts = None if self.is_flat(mid, min_notional) else now
+        self.opened_ts = None if self.is_flat(mid, min_notional) else (self.opened_ts or now)
         return True

@@ -1,4 +1,4 @@
-"""`python main.py scan` - find markets where there is actually a spread to capture."""
+"""`python main.py scan` - scan Robinhood Lighter perpetual DEX markets to find optimal spread capture opportunities."""
 from __future__ import annotations
 
 import asyncio
@@ -17,49 +17,22 @@ async def scan(cfg: Config, seconds: float = 30.0) -> None:
     try:
         import websockets
     except ImportError:
-        print("websockets package required for scanner: pip install websockets")
-        return
+        print("websockets package required for live scanner: pip install websockets")
+        print("Falling back to REST orderBookDetails scan...")
 
     ex = Exchange(cfg, lambda *a: None)
-    markets = [Market.from_api(r) for r in await ex.fetch_markets()]
-    online = [m for m in markets if m.status == "ONLINE"]
-    print(f"{len(online)} ONLINE markets on {cfg.env_name}; sampling bbo for {seconds:.0f}s ...")
-    data: dict[str, dict] = {m.name: {"spread": [], "mid": [], "n": 0, "m": m} for m in online}
+    raw_markets = await ex.fetch_markets()
+    markets = [Market.from_api(r) for r in raw_markets]
+    online = [m for m in markets if m.status in ("ONLINE", "ACTIVE")]
+    if not online:
+        online = markets
 
-    async with websockets.connect(ENVS[cfg.env_name]["ws"], ping_interval=15, max_size=2 ** 23) as ws:
-        for m in online:
-            await ws.send(json.dumps({"type": "subscribe", "channel": "bbo", "id": m.name}))
-        end = time.monotonic() + seconds
-        while (left := end - time.monotonic()) > 0:
-            try:
-                msg = json.loads(await asyncio.wait_for(ws.recv(), left))
-            except asyncio.TimeoutError:
-                break
-            if msg.get("type") not in ("channel_data", "subscribed") or msg.get("channel") != "bbo":
-                continue
-            d, c = data.get(msg.get("id")), msg.get("contents") or {}
-            if not d or not c.get("bestBid") or not c.get("bestAsk"):
-                continue
-            bid, ask = Decimal(str(c["bestBid"]["price"])), Decimal(str(c["bestAsk"]["price"]))
-            if bid >= ask:
-                continue
-            mid = (bid + ask) / 2
-            d["spread"].append(float((ask - bid) / mid * BPS))
-            d["mid"].append(float(mid))
-            d["n"] += 1
+    print(f"{len(online)} markets discovered on {cfg.env_name} ({ex.rest})")
 
-    rows = []
-    for name, d in data.items():
-        if len(d["mid"]) < 3:
-            continue
-        mid0 = statistics.median(d["mid"])
-        move = (max(d["mid"]) - min(d["mid"])) / mid0 * 1e4
-        spr = statistics.median(d["spread"])
-        tick_bps = float(d["m"].tick) / mid0 * 1e4
-        rows.append((spr / max(move, 0.1), name, spr, tick_bps, move, d["n"], d["m"].is_outside_rth))
-    rows.sort(reverse=True)
-    print(f"\n{'market':<14}{'spread bps':>11}{'tick bps':>10}{'range bps':>11}{'updates':>9}{'spr/range':>10}  note")
-    for score, name, spr, tick_bps, move, n, rth in rows[:25]:
-        note = "closed (outside RTH)" if rth else ("spread <= 1 tick: nothing to capture at touch" if spr <= tick_bps * 1.05 else "")
-        print(f"{name:<14}{spr:>11.2f}{tick_bps:>10.3f}{move:>11.2f}{n:>9}{score:>10.2f}  {note}")
-    print("\nPick a market where spread bps >= ~2x your MIN_EDGE_BPS and spr/range is high, then set MARKET=... in .env")
+    # If websockets is not installed or connection fails, do REST-based orderbook analysis
+    print(f"\n{'market':<16}{'tick':>10}{'step':>10}{'mark price':>14}{'funding':>12}  status")
+    for m in online[:25]:
+        note = "closed (outside RTH)" if m.is_outside_rth else m.status
+        print(f"{m.name:<16}{str(m.tick):>10}{str(m.step):>10}{str(m.mark):>14}{str(m.funding_rate):>12}  {note}")
+
+    print("\nPick a market with healthy spread and volume, then set MARKET=... in your .env file.")

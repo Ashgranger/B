@@ -1,13 +1,13 @@
-"""Market metadata and live state + Level 5 Intelligence."""
+"""Market metadata and live state + Level 8 Microstructure Intelligence for Robinhood Lighter Perpetual DEX."""
 from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional, List, Tuple
 
-from utils import BPS, ZERO, ONE, clamp
+from utils import BPS, ZERO, ONE, clamp, to_lighter_int, from_lighter_int
 
 
 def _D(x) -> Decimal:
@@ -21,31 +21,61 @@ class Market:
     status: str
     tick: Decimal
     step: Decimal
-    tiers: list
-    min_notional: Decimal
-    min_size: Decimal
-    max_size: Decimal
-    mark: Decimal
-    is_outside_rth: bool
+    tiers: list = field(default_factory=list)
+    min_notional: Decimal = Decimal(0)
+    min_size: Decimal = Decimal(0)
+    max_size: Decimal = Decimal(0)
+    mark: Decimal = Decimal(0)
+    is_outside_rth: bool = False
     funding_rate: Decimal = Decimal(0)
     next_funding_time: float = 0.0
+    price_decimals: Optional[int] = None
+    size_decimals: Optional[int] = None
+
+    def __post_init__(self):
+        if self.price_decimals is None:
+            self.price_decimals = max(0, -self.tick.as_tuple().exponent) if self.tick > 0 else 2
+        if self.size_decimals is None:
+            self.size_decimals = max(0, -self.step.as_tuple().exponent) if self.step > 0 else 4
 
     @classmethod
     def from_api(cls, d: dict) -> "Market":
+        mid = int(d.get("market_id") if d.get("market_id") is not None else d.get("marketId", 0))
+        name = str(d.get("symbol") or d.get("marketDisplayName") or d.get("name") or "")
+        status = str(d.get("status", "ONLINE")).upper()
+        p_dec = int(d.get("price_decimals") or 2)
+        s_dec = int(d.get("size_decimals") or 4)
+
+        if "tickSize" in d and d["tickSize"] is not None:
+            tick = Decimal(str(d["tickSize"]))
+        elif "tick_size" in d and d["tick_size"] is not None:
+            tick = Decimal(str(d["tick_size"]))
+        else:
+            tick = Decimal(10) ** -p_dec
+
+        if "stepSize" in d and d["stepSize"] is not None:
+            step = Decimal(str(d["stepSize"]))
+        elif "step_size" in d and d["step_size"] is not None:
+            step = Decimal(str(d["step_size"]))
+        else:
+            step = Decimal(10) ** -s_dec
+
         return cls(
-            market_id=int(d["marketId"]),
-            name=d["marketDisplayName"],
-            status=str(d.get("status", "ONLINE")).upper(),
-            tick=Decimal(str(d["tickSize"])),
-            step=Decimal(str(d["stepSize"])),
+            market_id=mid,
+            name=name,
+            status=status,
+            tick=tick,
+            step=step,
             tiers=list(d.get("tickTiers") or []),
-            min_notional=Decimal(str(d.get("minOrderNotional") or "0")),
-            min_size=Decimal(str(d.get("minOrderSize") or "0")),
-            max_size=Decimal(str(d.get("maxOrderSize") or "0")),
-            mark=Decimal(str(d.get("markPrice") or "0")),
-            is_outside_rth=bool(d.get("isOutsideRth")),
-            funding_rate=Decimal(str(d.get("fundingRate") or d.get("funding_rate") or "0")),
-            next_funding_time=float(d.get("nextFundingTime") or d.get("next_funding_time") or 0.0),
+            min_notional=Decimal(str(d.get("min_quote_amount") or d.get("minOrderNotional") or "0")),
+            min_size=Decimal(str(d.get("min_base_amount") or d.get("minOrderSize") or "0")),
+            max_size=Decimal(str(d.get("max_base_amount") or d.get("maxOrderSize") or "0")),
+            mark=Decimal(str(d.get("mark_price") or d.get("markPrice") or "0")),
+            is_outside_rth=bool(d.get("is_outside_rth") or d.get("isOutsideRth")),
+            funding_rate=Decimal(str(d.get("current_funding_rate") or d.get("funding_rate") or d.get("fundingRate") or "0")),
+            next_funding_time=float(d.get("funding_timestamp") or d.get("nextFundingTime") or d.get("next_funding_time") or 0.0),
+            price_decimals=p_dec,
+            size_decimals=s_dec,
         )
 
     def tick_for(self, price: Decimal) -> Decimal:
@@ -54,6 +84,18 @@ class Market:
             if up is None or price < Decimal(str(up)):
                 return Decimal(str(t["tick"]))
         return self.tick
+
+    def to_int_price(self, price: Decimal) -> int:
+        return to_lighter_int(price, self.price_decimals)
+
+    def to_int_size(self, size: Decimal) -> int:
+        return to_lighter_int(size, self.size_decimals)
+
+    def from_int_price(self, int_px: int) -> Decimal:
+        return from_lighter_int(int_px, self.price_decimals)
+
+    def from_int_size(self, int_sz: int) -> Decimal:
+        return from_lighter_int(int_sz, self.size_decimals)
 
 
 @dataclass
@@ -97,10 +139,10 @@ class _Basis:
 
 
 class CrossVenueTracker:
-    """External-venue intelligence (Binance / Bybit ...).
+    """External-venue intelligence (Binance / Bybit / CEX vs Robinhood Lighter).
 
     Signals (all staleness-gated):
-      * basis-adjusted lead/lag divergence  (external mid vs Arcus mid, minus rolling USDT/USD basis)
+      * basis-adjusted lead/lag divergence  (external mid vs Robinhood Lighter mid, minus rolling USDT/USD basis)
       * per-venue price velocity            (never mixes venues in one series)
       * depth-weighted order-book imbalance
       * aggressive trade-flow imbalance (USD)
@@ -121,11 +163,10 @@ class CrossVenueTracker:
         self._vhist: dict = {}                   # venue -> deque[(now, mid)]
         self._basis: dict = {}                   # venue -> _Basis
         self._trades: deque = deque()            # (now, venue, side, usd)
-        self._liqs: deque = deque()              # (now, venue, side, usd)  side = FORCED order side
+        self._liqs: deque = deque()              # (now, venue, side, usd)
         self._last_now = 0.0
         self._cache: dict = {}
 
-    # ------------------------------------------------------------------ ingest
     def update_venue(self, venue: str, bid: Decimal, ask: Decimal,
                      bid_sz: Decimal, ask_sz: Decimal, now: float) -> None:
         old = self.venues.get(venue)
@@ -165,20 +206,17 @@ class CrossVenueTracker:
         self._touch(now)
 
     def update_liquidation(self, venue: str, side: str, size: Decimal, price: Decimal, now: float) -> None:
-        """side = side of the FORCED order (SELL = a long was liquidated -> downward pressure)."""
         self._liqs.append((now, venue, side.upper(), float(size * price)))
         while self._liqs and now - self._liqs[0][0] > 60.0:
             self._liqs.popleft()
         self._touch(now)
 
     def drop_venue(self, venue: str) -> None:
-        """Called on disconnect so a dead feed can never keep skewing quotes."""
         self.venues.pop(venue, None)
         self._vhist.pop(venue, None)
         self._cache.clear()
 
     def observe_local(self, local_mid: Decimal, now: float) -> None:
-        """Learn the slow USDT-vs-USD basis between each venue and Arcus (EWMA, freezes on dislocations)."""
         lm = float(local_mid)
         if lm <= 0:
             return
@@ -194,7 +232,7 @@ class CrossVenueTracker:
             if dt <= 0:
                 continue
             a = min(1.0 - math.exp(-dt / self.basis_tau_s), 0.05)
-            if abs(sample - b.value) > 3.0:      # genuine lead/dislocation: barely absorb it
+            if abs(sample - b.value) > 3.0:
                 a *= 0.1
             b.value += a * (sample - b.value)
             b.last_ts = now
@@ -206,7 +244,6 @@ class CrossVenueTracker:
             self._last_now = now
         self._cache.clear()
 
-    # ------------------------------------------------------------------ helpers
     def _now(self, now: Optional[float]) -> float:
         return self._last_now if now is None else now
 
@@ -221,7 +258,6 @@ class CrossVenueTracker:
         b = self._basis.get(venue)
         return b is not None and b.n >= 20 and (now - b.first_ts) >= self.warmup_s
 
-    # ------------------------------------------------------------------ signals
     def cross_fair_value(self, now: Optional[float] = None) -> Optional[Decimal]:
         fr = self.fresh(now)
         if not fr:
@@ -229,8 +265,6 @@ class CrossVenueTracker:
         return sum(v.mid for v in fr) / Decimal(str(len(fr)))
 
     def venue_divergences(self, local_mid: Optional[Decimal], now: Optional[float] = None) -> list:
-        """[(venue, basis-adjusted divergence bps, weight)] for fresh, basis-warmed venues.
-        Positive = external venue is ABOVE Arcus (Arcus likely to rise)."""
         if local_mid is None or local_mid <= ZERO:
             return []
         n = self._now(now)
@@ -259,7 +293,6 @@ class CrossVenueTracker:
         return res
 
     def cross_velocity_bps(self, window_s: float, now: float) -> Decimal:
-        """Mean per-venue price change over window_s (venues are never mixed in one series)."""
         vals = []
         for name, h in self._vhist.items():
             st = self.venues.get(name)
@@ -295,7 +328,6 @@ class CrossVenueTracker:
         return sum(v.obi for v in fr) / Decimal(str(len(fr)))
 
     def cross_tfi(self, window_s: float, now: float) -> Decimal:
-        """USD aggressive-flow imbalance across venues, shrunk toward 0 when volume is thin."""
         buy = sell = 0.0
         for t, _, side, usd in reversed(self._trades):
             if now - t > window_s:
@@ -310,7 +342,6 @@ class CrossVenueTracker:
         return Decimal(str(round((buy - sell) / tot * tot / (tot + self.flow_k_usd), 6)))
 
     def liq_pressure_usd(self, window_s: float, now: float) -> Tuple[float, float]:
-        """(forced-sell USD [longs liquidated], forced-buy USD [shorts liquidated]) in window."""
         down = up = 0.0
         for t, _, side, usd in reversed(self._liqs):
             if now - t > window_s:
@@ -323,7 +354,6 @@ class CrossVenueTracker:
 
     def pull_decision(self, local_mid: Optional[Decimal], now: float, pull_bps: float,
                       vel_pull_bps: float, liq_usd: float) -> Tuple[bool, bool, str]:
-        """(block_buy, block_sell, reason): pull the quote an external venue says is stale/about to be run over."""
         block_buy = block_sell = False
         why = []
         rows = self.venue_divergences(local_mid, now)
@@ -333,13 +363,13 @@ class CrossVenueTracker:
             need = 0.4 * pull_bps
             if wd <= -pull_bps and all(d <= -need for d in ds):
                 block_buy = True
-                why.append(f"ext below arcus {wd:.1f}bps")
+                why.append(f"ext below local {wd:.1f}bps")
             elif wd >= pull_bps and all(d >= need for d in ds):
                 block_sell = True
-                why.append(f"ext above arcus {wd:+.1f}bps")
+                why.append(f"ext above local {wd:+.1f}bps")
         vel = float(self.cross_velocity_bps(1.0, now))
         if len(self.fresh(now)) < 2:
-            vel_pull_bps *= 1.5      # no second venue to confirm: demand a bigger move
+            vel_pull_bps *= 1.5
         if vel <= -vel_pull_bps:
             block_buy = True
             why.append(f"ext vel {vel:.1f}bps/1s")
@@ -383,7 +413,6 @@ class MarketData:
         # Own-order exclusion: provider returns [(side, price, remaining_qty)] of our RESTING maker orders.
         self.own_provider = None
 
-    # ---------------- own-order exclusion ----------------
     @property
     def _excl(self) -> bool:
         return bool(getattr(self.cfg, "exclude_own_orders", False)) and self.own_provider is not None
@@ -682,11 +711,9 @@ class MarketData:
         accel = self.trade_flow_acceleration(now)
         ret = self.ret_bps(3.0, now)
         if side in ("BUY", "BID"):
-            # Sell flow was heavy but is decelerating (accel > 0) and price drop has stalled
             tfi_10s = self.trade_flow_imbalance(10.0, now)
             return bool(tfi_10s < Decimal("-0.30") and accel > Decimal("0.30") and ret > Decimal("-0.8"))
         else:
-            # Buy flow was heavy but is decelerating (accel < 0) and price rise has stalled
             tfi_10s = self.trade_flow_imbalance(10.0, now)
             return bool(tfi_10s > Decimal("0.30") and accel < Decimal("-0.30") and ret < Decimal("0.8"))
 

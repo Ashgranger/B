@@ -17,15 +17,19 @@ class Fatal(Exception):
 
 
 def q_down(x: Decimal, unit: Decimal) -> Decimal:
+    if unit <= ZERO:
+        return x
     return (x / unit).to_integral_value(rounding=ROUND_DOWN) * unit
 
 
 def q_up(x: Decimal, unit: Decimal) -> Decimal:
+    if unit <= ZERO:
+        return x
     return (x / unit).to_integral_value(rounding=ROUND_UP) * unit
 
 
 def to_int(value: Decimal, unit: Decimal) -> int:
-    """Exact decimal -> integer ticks/quantums (the signed payload needs exactness)."""
+    """Exact decimal -> integer ticks/quantums."""
     n = value / unit
     rounded = round(n)
     if abs(n - rounded) < Decimal("0.00001"):
@@ -33,6 +37,17 @@ def to_int(value: Decimal, unit: Decimal) -> int:
     if n != n.to_integral_value():
         raise ValueError(f"{value} is not a multiple of {unit}")
     return int(n)
+
+
+def to_lighter_int(value: Decimal, decimals: int) -> int:
+    """Convert a Decimal value to integer scaling using base 10^decimals for Lighter."""
+    multiplier = Decimal(10 ** decimals)
+    return int((value * multiplier).to_integral_value(rounding=ROUND_DOWN))
+
+
+def from_lighter_int(value: int, decimals: int) -> Decimal:
+    """Convert an integer scaled by 10^decimals back to Decimal."""
+    return Decimal(value) / Decimal(10 ** decimals)
 
 
 def fmt(d: Decimal) -> str:
