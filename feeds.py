@@ -31,7 +31,7 @@ D = Decimal
 
 
 def derive_symbol(market: str, override: str = "") -> str:
-    """Arcus 'SOL-USD' -> 'SOLUSDT' (override with BINANCE_SYMBOL / BYBIT_SYMBOL, e.g. 1000PEPEUSDT)."""
+    """Bulk Trade 'SOL-USD' -> 'SOLUSDT' (override with BINANCE_SYMBOL / BYBIT_SYMBOL, e.g. 1000PEPEUSDT)."""
     if override:
         return override.upper()
     base = market.upper().split("-")[0].split("/")[0].strip()

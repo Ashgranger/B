@@ -1,86 +1,126 @@
-"""Small shared helpers (decimal maths, canonical JSON, logging)."""
+"""Ultra-low latency utility functions, math helpers, fast Base58, and constants for Bulk Trade bot."""
 from __future__ import annotations
 
 import json
 import logging
+import sys
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
-BPS = Decimal("10000")
+log = logging.getLogger("utils")
+
+# Mathematical & protocol constants
+BPS = Decimal("0.0001")
 ZERO = Decimal("0")
 ONE = Decimal("1")
-BUY, SELL = "BUY", "SELL"
+BULK_SCALE = Decimal("100000000")  # 1e8 fixed point scale for Bulk Trade protocol
+BULK_SCALE_INT = 100000000
+USDC_DECIMALS = 6
+USDC_BASE_UNIT = Decimal("1000000")
+
+BUY = "BUY"
+SELL = "SELL"
+
+# Fast Base58 table lookups (Solana / Bitcoin standard)
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B58_INDEX = [-1] * 256
+for _i, _c in enumerate(B58_ALPHABET):
+    B58_INDEX[ord(_c)] = _i
+
+
+def b58encode(b: bytes) -> str:
+    """High-speed Base58 encoding."""
+    if not b:
+        return ""
+    n = int.from_bytes(b, "big")
+    chars = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        chars.append(B58_ALPHABET[r])
+    pad = 0
+    for byte in b:
+        if byte == 0:
+            pad += 1
+        else:
+            break
+    return "1" * pad + "".join(reversed(chars)) if chars else "1" * pad
+
+
+def b58decode(s: str) -> bytes:
+    """High-speed O(1) lookup table Base58 decoding."""
+    if not s:
+        return b""
+    n = 0
+    for c in s:
+        idx = B58_INDEX[ord(c)]
+        if idx == -1:
+            raise ValueError(f"Invalid Base58 character: '{c}'")
+        n = n * 58 + idx
+    full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n > 0 else b""
+    pad = 0
+    for c in s:
+        if c == "1":
+            pad += 1
+        else:
+            break
+    return b"\x00" * pad + full
 
 
 class Fatal(Exception):
-    """Unrecoverable config / market problem - do not reconnect."""
+    """Unrecoverable startup or operational error."""
+    pass
 
 
 def q_down(x: Decimal, unit: Decimal) -> Decimal:
-    if unit <= ZERO:
-        return x
-    return (x / unit).to_integral_value(rounding=ROUND_DOWN) * unit
+    """Quantize downward to nearest tick/step unit."""
+    return (x / unit).quantize(Decimal("1"), rounding=ROUND_DOWN) * unit
 
 
 def q_up(x: Decimal, unit: Decimal) -> Decimal:
-    if unit <= ZERO:
-        return x
-    return (x / unit).to_integral_value(rounding=ROUND_UP) * unit
+    """Quantize upward to nearest tick/step unit."""
+    return (x / unit).quantize(Decimal("1"), rounding=ROUND_UP) * unit
 
 
 def to_int(value: Decimal, unit: Decimal) -> int:
-    """Exact decimal -> integer ticks/quantums."""
-    n = value / unit
-    rounded = round(n)
-    if abs(n - rounded) < Decimal("0.00001"):
-        return int(rounded)
-    if n != n.to_integral_value():
-        raise ValueError(f"{value} is not a multiple of {unit}")
-    return int(n)
+    """Scale a decimal value into discrete integer units."""
+    return int((value / unit).quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
-def to_lighter_int(value: Decimal, decimals: int) -> int:
-    """Convert a Decimal value to integer scaling using base 10^decimals for Lighter."""
-    multiplier = Decimal(10 ** decimals)
-    return int((value * multiplier).to_integral_value(rounding=ROUND_DOWN))
+def to_fixed_u64(val: Decimal) -> int:
+    """Fast Bulk Trade fixed-point u64 conversion (1e8 scale)."""
+    return int((val * BULK_SCALE).quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
-def from_lighter_int(value: int, decimals: int) -> Decimal:
-    """Convert an integer scaled by 10^decimals back to Decimal."""
-    return Decimal(value) / Decimal(10 ** decimals)
+def from_fixed_u64(val: int) -> Decimal:
+    """Fast Bulk Trade fixed-point u64 to Decimal conversion (1e8 scale)."""
+    return Decimal(val) / BULK_SCALE
 
 
 def fmt(d: Decimal) -> str:
-    return format(d.normalize(), "f")
+    """Format decimal cleanly removing trailing zeros."""
+    s = f"{d:f}"
+    return s.rstrip("0").rstrip(".") if "." in s else s
 
 
 def canonical(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+    """Fast deterministic JSON string for Ed25519 cryptographic signing."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
 def clamp(x: Decimal, lo: Decimal, hi: Decimal) -> Decimal:
+    """Clamp decimal x within [lo, hi]."""
     return max(lo, min(hi, x))
 
 
 def bps_diff(a: Decimal, b: Decimal) -> Decimal:
-    """(a - b) / b in basis points."""
-    return (a - b) / b * BPS if b else ZERO
+    """Basis points difference: (a - b) / b * 10,000."""
+    if b == ZERO:
+        return ZERO
+    return ((a - b) / b) * Decimal("10000")
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """Dated timestamps (multi-day runs) + optional size-rotated file via LOG_FILE / LOG_MAX_MB / LOG_BACKUPS."""
-    import os
-    from logging.handlers import RotatingFileHandler
-    handlers = [logging.StreamHandler()]
-    path = os.getenv("LOG_FILE", "").strip()
-    if path:
-        mb = float(os.getenv("LOG_MAX_MB", "20"))
-        handlers.append(RotatingFileHandler(path, maxBytes=int(mb * 1024 * 1024),
-                                            backupCount=int(os.getenv("LOG_BACKUPS", "10")), encoding="utf-8"))
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%m-%d %H:%M:%S",
-        handlers=handlers,
-        force=True,
-    )
+    """Configure structured logging."""
+    num_level = getattr(logging, level.upper(), logging.INFO)
+    fmt_str = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
+    logging.basicConfig(level=num_level, format=fmt_str, datefmt="%H:%M:%S", stream=sys.stdout)

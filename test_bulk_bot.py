@@ -1,219 +1,283 @@
-"""Comprehensive Test Suite for Bulk Trade Perpetual DEX Level 8+ Market Maker Bot.
-
-Tests:
-1. Solana Ed25519 signing, Base58 codecs, domain separation, and pre-computed deterministic Order IDs
-2. Multi-ladder quote generation and individual slot tracking
-3. Bulk Trade fee schedule enforcement (0.010% maker, 0.035% taker) and guaranteed spread capture
-4. Positive Unrealized PnL dynamic trailing exit ("Let Winners Run")
-5. Reversal frontrunning and emergency taker profit lock
-6. Order Book Intelligence: microprice and multi-level OBI
-7. Level 4 Adaptive EV quote filtering
-8. Level 6 Online learning and Empirical Bayesian markout shrinkage
-9. Level 8 One-sided touch protection against aggressive toxic flow
-10. L2 VWAP order book walking for taker unwind
-11. Atomic multi-order batch / group transactions
-12. Quote opportunity dataset logging
-"""
+"""Comprehensive test suite for Bulk Trade Perp DEX Market Maker Bot."""
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import sys
 import unittest
-from decimal import Decimal as D
+from decimal import Decimal
 
-import sim
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
 from config import Config
-from market import Market
-from signer import BulkSigner, compute_order_id, DOMAIN_MAINNET, DOMAIN_DEVNET
-from utils import BUY, SELL, BPS, ZERO, ONE, b58encode, b58decode, fmt
+from exchange import Exchange
+from market import Market, MarketData
+from orders import Order, OrderManager
+from signer import Signer, SignatureDomain
+from ledger import Ledger
+from engine import MarketMakingEngine
+from utils import (
+    b58decode,
+    b58encode,
+    canonical,
+    to_fixed_u64,
+    from_fixed_u64,
+    BUY,
+    SELL,
+    ZERO,
+    ONE,
+    bps_diff,
+)
 
 
-class TestBulkTradeMarketMaker(unittest.IsolatedAsyncioTestCase):
+class TestBulkTradeBot(unittest.IsolatedAsyncioTestCase):
+    """Unit and Integration Tests for Bulk Trade Bot components."""
 
-    def test_01_solana_ed25519_signing_and_precomputed_order_id(self):
-        """Test Solana Ed25519 cryptographic signing, base58 encoding, and precomputed Order ID."""
-        signer = BulkSigner(environment="devnet")
-        self.assertEqual(len(b58decode(signer.signer_pubkey)), 32, "Pubkey must be 32 bytes")
-        self.assertEqual(signer.domain, DOMAIN_DEVNET)
+    def setUp(self):
+        # Deterministic 32-byte Ed25519 test seed
+        self.test_seed = bytes([i % 256 for i in range(32)])
+        self.signer = Signer(self.test_seed, domain=SignatureDomain.MAINNET)
 
-        # Sign a single order action
-        tx = signer.sign_order(
-            symbol="BTC-USD",
-            is_buy=True,
-            price=85000.0,
-            size=0.05,
-            order_type="limit",
-            tif="ALO",
+        # Mock configuration
+        import os
+        os.environ["BULK_ENV"] = "mainnet"
+        os.environ["BULK_PRIVATE_KEY"] = b58encode(self.test_seed)
+        os.environ["BULK_ACCOUNT"] = self.signer.account_b58
+        os.environ["MARKET"] = "SOL-USD"
+        os.environ["DRY_RUN"] = "1"
+        self.cfg = Config.from_env()
+
+        self.mock_market = Market(
+            market_id=1,
+            name="SOL-USD",
+            status="ONLINE",
+            tick=Decimal("0.01"),
+            step=Decimal("0.01"),
+            tiers=[],
+            min_notional=Decimal("5.0"),
+            min_size=Decimal("0.01"),
+            max_size=Decimal("10000"),
+            mark=Decimal("150.00"),
+            is_outside_rth=False,
+            funding_rate=Decimal("0.0001"),
+            next_funding_time=0.0,
         )
-        self.assertIn("signature", tx)
-        self.assertIn("order_id", tx)
-        self.assertEqual(len(b58decode(tx["signature"])), 64, "Signature must be 64 bytes")
 
-        # Verify signature cryptographically
-        msg_bytes = signer.build_signing_bytes(tx["actions"], tx["nonce"])
-        self.assertTrue(signer.verify(tx["signature"], msg_bytes), "Signature must verify against signer public key")
-
-        # Verify deterministic precomputed Order ID derivation matches compute_order_id
-        action = tx["actions"][0]
-        expected_oid = compute_order_id(action, tx["nonce"], signer.account_pubkey, seqno=0)
-        self.assertEqual(tx["order_id"], expected_oid, "Precomputed order ID must match deterministic derivation")
-        print(f"✓ test_01 passed: Solana Ed25519 signed, verified, and precomputed order ID: {tx['order_id'][:16]}...")
-
-    async def test_02_multi_ladder_quote_placement(self):
-        """Test multi-ladder quotes placed and tracked individually across slots (pair_index, side)."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=1, ORDER_USD=25, MAX_POSITION_USD=100, SKEW_BPS=0)
-        await sim.step(bot, s, clock, "85000.0", "85100.0")
-
-        buy_orders = bot.om.side_orders(BUY)
-        sell_orders = bot.om.side_orders(SELL)
-
-        self.assertGreaterEqual(len(buy_orders), 1, "Must have resting buy orders")
-        self.assertGreaterEqual(len(sell_orders), 1, "Must have resting sell orders")
-
-        for o in bot.om.orders.values():
-            self.assertIn(o.pair_index, [0, 1])
-            self.assertIn(o.side, [BUY, SELL])
-            self.assertGreater(o.price, D("0"))
-            self.assertGreater(o.remaining, D("0"))
-        print("✓ test_02 passed: Multi-ladder quotes generated and tracked individually.")
-
-    async def test_03_fee_schedule_and_spread_capture(self):
-        """Test Bulk Trade fee schedule: Maker 1.0 bps (0.010%) / Taker 3.5 bps (0.035%)."""
-        bot, s, clock = sim.make(MAKER_FEE_BPS="1.0", TAKER_FEE_BPS="3.5", GUARANTEE_SPREAD_CAPTURE="1", ENABLE_ADAPTIVE_EV="0")
-        self.assertEqual(bot.cfg.maker_fee_bps, D("1.0"))
-        self.assertEqual(bot.cfg.taker_fee_bps, D("3.5"))
-
-        # Quoting edge must strictly cover roundtrip maker fee (2 * 1.0 = 2.0 bps) + margin (0.5 bps) = 2.5 bps
-        targets = bot.engine.generate_ladder_quotes(
-            m=bot.md.info, md=bot.md, ledger=bot.ledger, now=clock.t,
-            buy_blocked=False, sell_blocked=False
-        )
-        for t in targets:
-            dist_bps = abs(t.price - bot.md.mid) / bot.md.mid * BPS
-            self.assertGreaterEqual(dist_bps, D("2.0"), "Quoting edge must strictly cover maker fees")
-
-        # Test fill accounting with maker fee on Bulk
-        await sim.step(bot, s, clock, "80000.0", "80100.0")
-        s.taker(BUY)  # Fills our sell quote as maker
-        self.assertGreater(bot.ledger.fees, D("0"), "Maker fee must be debited")
-        expected_fee_ratio = D("1.0") / BPS
-        self.assertAlmostEqual(float(bot.ledger.fees / bot.ledger.volume_usd), float(expected_fee_ratio), places=5)
-        print("✓ test_03 passed: Exact Bulk Trade fee schedule and spread capture enforced.")
-
-    async def test_04_positive_unrealized_pnl_trailing(self):
-        """Test Positive Unrealized PnL: trails exit quote higher when market flow is favorable."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=0, POS_PROFIT_TRAIL_ENABLED=1, POS_PROFIT_MIN_BPS="2.9")
-        # Step into Long position
-        await sim.step(bot, s, clock, "85000.0", "85100.0")
-        s.taker(SELL)  # Fills our buy order -> Long
-        self.assertGreater(bot.ledger.position, D("0"), "Bot must be Long")
-
-        # Market surges upward in our favor! Mid rises to 85200 with heavy aggressive buying
-        await sim.step(bot, s, clock, "85150.0", "85250.0", bsz="10", asz="1")
-        bot.md.on_trade(BUY, D("5.0"), D("85200.0"), clock.t)
-
-        unreal_bps = bot.ledger.unrealized_bps(bot.md.mid)
-        self.assertGreater(unreal_bps, D("0"), "Must have positive unrealized PnL")
-
-        targets = bot.engine.generate_ladder_quotes(
-            m=bot.md.info, md=bot.md, ledger=bot.ledger, now=clock.t,
-            buy_blocked=False, sell_blocked=False
-        )
-        unwind_quotes = [t for t in targets if t.is_exit_quote and t.side == SELL]
-        self.assertEqual(len(unwind_quotes), 1, "Must generate unwind sell quote")
-        unwind_ask = unwind_quotes[0]
-
-        # The exit ask must be trailed higher above minimum target to ride favorable momentum
-        expected_min_ask = bot.ledger.avg_cost * (D("1") + D("2.9") / BPS)
-        self.assertGreaterEqual(unwind_ask.price, expected_min_ask, "Trailing exit must expand profit")
-        print(f"✓ test_04 passed: Unrealized PnL +{fmt(unreal_bps)} bps trailed to {unwind_ask.price}.")
-
-    async def test_05_orderbook_intelligence_microprice(self):
-        """Test Level 5 Order-Book Intelligence: heavy buy pressure shifts fair value and protects ask."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=0, ENABLE_ORDERBOOK_INTEL=1, USE_MICRO=1)
-        await sim.step(bot, s, clock, "85000.0", "85100.0", bsz="1", asz="1")
-        initial_ask = bot.om.get_order_by_slot(0, SELL)
-        self.assertIsNotNone(initial_ask, "Initial ask must be active")
-        init_ask_px = initial_ask.price
-
-        # Heavy bid pressure arrives: bid size = 15, ask size = 0.5 (microprice pumps toward ask)
-        await sim.step(bot, s, clock, "85000.0", "85100.0", bsz="15", asz="0.5")
-        new_ask = bot.om.get_order_by_slot(0, SELL)
-        if new_ask is None:
-            print("✓ test_05 passed: Toxic ask pulled completely (EV protection).")
-        else:
-            self.assertGreater(new_ask.price, init_ask_px, "Ask must reprice higher to protect against toxic buying")
-            print(f"✓ test_05 passed: Ask lifted from {init_ask_px} to {new_ask.price}.")
-
-    async def test_06_adaptive_ev_filter(self):
-        """Test Level 4 Adaptive EV: quotes suppressed when Expected Value < MIN_EV_BPS."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=0, MIN_EV_BPS="5.0", ENABLE_ADAPTIVE_EV="1", MIN_EDGE_BPS="1.0", ENABLE_SELECTIVE_TOUCH="0")
-        # Extremely tight market where spread cannot deliver 5.0 bps EV
-        await sim.step(bot, s, clock, "85000.0", "85000.5")
-        # Bot should refrain from quoting negative EV touch
-        buy_orders = bot.om.side_orders(BUY)
-        self.assertEqual(len(buy_orders), 0, "Quotes with EV < 5.0 bps must be filtered")
-        print("✓ test_06 passed: Adaptive EV filter successfully blocked negative EV quotes.")
-
-    async def test_07_online_learning_bayesian_markout(self):
-        """Test Level 6 Online Learning: adverse markouts update toxicity and Bayesian model."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=0, MARKOUT_HORIZON_S=1.0, TOX_MULT=2.0, ENABLE_ONLINE_LEARNING=1)
-        await sim.step(bot, s, clock, "85000.0", "85100.0")
-
-        # Simulate buy fill at 85000
-        bot.ledger.on_fill(BUY, D("0.001"), D("85000.0"), D("85050.0"), clock.t, D("5.0"))
-
-        # Market dumps adversely to 84800 at markout horizon
-        clock.advance(1.5)
-        bot.ledger.process_markouts(D("84800.0"), clock.t)
-
-        self.assertGreater(bot.ledger.tox_bps, D("0"), "Toxicity must increase on adverse fill")
-        buy_tox = bot.ledger.side_tox_bps(BUY)
-        self.assertGreater(buy_tox, D("10.0"), "Buy side toxicity must reflect adverse markout")
-        print(f"✓ test_07 passed: Bayesian markout learned buy-side toxicity = {buy_tox:.2f} bps.")
-
-    async def test_08_one_sided_touch_protection(self):
-        """Test Level 8 One-Sided Touch: suppresses quotes into toxic flow surges."""
-        bot, s, clock = sim.make(EXTRA_LEVELS=1, ENABLE_ONESIDED_TOUCH=1)
-        await sim.step(bot, s, clock, "80000.0", "80010.0")
-
-        # Simulate massive aggressive buying burst: TFI = +0.8, regime = TOXIC
-        for _ in range(5):
-            bot.md.on_trade(BUY, D("2.0"), D("80010.0"), clock.t)
-        bot.ledger.markouts.append(D("-5.0"))
-
-        quotes = bot.engine.generate_ladder_quotes(bot._get_market(), bot.md, bot.ledger, clock.t, False, False)
-        touch_sells = [q for q in quotes if q.side == SELL and q.pair_index == 0]
-        self.assertEqual(len(touch_sells), 0, "Touch SELL must be suppressed during aggressive buying steam")
-        print("✓ test_08 passed: One-sided touch protection active.")
-
-    async def test_09_l2_vwap_taker_book_walking(self):
-        """Test Order Book Walk for Taker Cross Cost across multiple depth levels."""
-        bot, s, clock = sim.make(TAKER_FEE_BPS="3.5")
-        await sim.step(bot, s, clock, "85000.0", "85010.0")
-        bot.md.on_depth([[D("85000.0"), D("1.0")]],
-                        [[D("85010.0"), D("0.1")], [D("85020.0"), D("0.2")]], clock.t)
-
-        vwap, cross_cost_bps = bot.engine.calculate_vwap_cross_cost(BUY, D("0.2"), bot.md)
-        self.assertEqual(vwap, D("85015.0"))
-        self.assertGreater(cross_cost_bps, D("3.5"), "Cross cost must exceed taker fee")
-        print(f"✓ test_09 passed: L2 depth VWAP walk calculated vwap={vwap}, cross_cost={cross_cost_bps:.2f} bps.")
-
-    def test_10_atomic_multi_order_group_transaction(self):
-        """Test signing atomic grouped multi-order transactions on Bulk Trade."""
-        signer = BulkSigner(environment="mainnet")
-        actions = [
-            {"type": "cancel", "symbol": "BTC-USD", "order_id": "test-order-1"},
-            {"type": "order", "symbol": "BTC-USD", "is_buy": True, "price": 85000.0, "size": 0.05, "order_type": {"type": "limit", "tif": "ALO"}, "reduce_only": False},
+    # 1. Base58 Tests
+    def test_01_base58_encoding_decoding(self):
+        test_cases = [
+            b"",
+            b"\x00",
+            b"\x00\x00\x01\x02",
+            b"Hello Solana Bulk Trade!",
+            self.test_seed,
         ]
-        tx = signer.sign_group(actions)
-        self.assertEqual(len(tx["actions"]), 2)
-        self.assertIn("order_ids", tx)
-        self.assertIsNone(tx["order_ids"][0], "Cancel has no precomputed order ID")
-        self.assertIsNotNone(tx["order_ids"][1], "Place action gets precomputed order ID")
-        print(f"✓ test_10 passed: Atomic group transaction signed with {len(tx['actions'])} actions.")
+        for data in test_cases:
+            enc = b58encode(data)
+            dec = b58decode(enc)
+            self.assertEqual(dec, data, f"Mismatch for {data}: {enc} -> {dec}")
+
+    # 2. Ed25519 Signing & Verification
+    def test_02_ed25519_signing_and_verification(self):
+        action = self.signer.build_limit_action("SOL-USD", BUY, Decimal("149.50"), Decimal("0.5"), "ALO")
+        envelope, oids = self.signer.sign_transaction([action], nonce=1700000000000)
+
+        self.assertEqual(envelope["account"], self.signer.account_b58)
+        self.assertEqual(envelope["signer"], self.signer.pubkey_b58)
+        self.assertTrue(len(envelope["signature"]) > 40)
+        self.assertTrue(len(oids) == 1 and len(oids[0]) > 20)
+
+        # Cryptographically verify the signature
+        msg_payload = {
+            "domain": self.signer.domain,
+            "account": self.signer.account_b58,
+            "signer": self.signer.pubkey_b58,
+            "nonce": envelope["nonce"],
+            "actions": envelope["actions"],
+        }
+        canonical_bytes = canonical(msg_payload).encode("utf-8")
+        pubkey = ed25519.Ed25519PublicKey.from_public_bytes(self.signer.pubkey_bytes)
+        sig_bytes = b58decode(envelope["signature"])
+        # Should not raise cryptography.exceptions.InvalidSignature
+        pubkey.verify(sig_bytes, canonical_bytes)
+
+    # 3. Builder Code Attachment
+    def test_03_builder_code_attachment(self):
+        signer_with_builder = Signer(
+            self.test_seed,
+            builder_to="9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            builder_fee_bps=5,
+        )
+        act = signer_with_builder.build_limit_action("BTC-USD", BUY, Decimal("65000"), Decimal("0.1"))
+        self.assertIn("builderCode", act["l"])
+        self.assertEqual(act["l"]["builderCode"]["to"], "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin")
+        self.assertEqual(act["l"]["builderCode"]["fee"], 5)
+
+    # 4. Atomic Batch Transaction
+    def test_04_atomic_batch_transaction(self):
+        c_act = self.signer.build_cancel_action("old_order_123", "SOL-USD")
+        l_act1 = self.signer.build_limit_action("SOL-USD", BUY, Decimal("148.00"), Decimal("0.2"), "ALO")
+        l_act2 = self.signer.build_limit_action("SOL-USD", SELL, Decimal("152.00"), Decimal("0.2"), "ALO")
+
+        batch = [c_act, l_act1, l_act2]
+        envelope, oids = self.signer.sign_transaction(batch)
+
+        self.assertEqual(len(envelope["actions"]), 3)
+        self.assertEqual(len(oids), 3)
+        self.assertEqual(oids[0], "")  # Cancel action has no order ID
+        self.assertTrue(len(oids[1]) > 0)
+        self.assertTrue(len(oids[2]) > 0)
+        self.assertNotEqual(oids[1], oids[2])  # Unique precomputed IDs
+
+    # 5. Market Specification Parsing
+    def test_05_market_spec_parsing(self):
+        api_data = {
+            "symbol": "BTC-USD",
+            "tickSize": "0.10",
+            "stepSize": "0.001",
+            "minOrderSize": "0.001",
+            "maxOrderSize": "500",
+            "minOrderNotional": "10.0",
+            "markPrice": "82500.50",
+            "indexPrice": "82490.00",
+            "fundingRate": "0.00015",
+            "status": "ONLINE",
+        }
+        m = Market.from_api(api_data)
+        self.assertEqual(m.name, "BTC-USD")
+        self.assertEqual(m.tick, Decimal("0.10"))
+        self.assertEqual(m.step, Decimal("0.001"))
+        self.assertEqual(m.mark, Decimal("82500.50"))
+        self.assertEqual(m.funding_rate, Decimal("0.00015"))
+        self.assertEqual(m.status, "ONLINE")
+
+    # 6. Orderbook & Microstructure (OBI & TFI)
+    def test_06_orderbook_and_microstructure(self):
+        md = MarketData(self.cfg)
+        md.update(Decimal("149.90"), Decimal("150.10"), Decimal("100"), Decimal("50"), now=1.0)
+        
+        self.assertEqual(md.mid, Decimal("150.00"))
+        # OBI = (100 - 50) / 150 = +0.3333...
+        self.assertAlmostEqual(float(md.obi), 0.3333, places=3)
+        # Microprice should be pulled toward ask because bid size is larger
+        self.assertTrue(md.micro > md.mid)
+
+        # Ingest aggressive trades
+        md.on_trade(BUY, Decimal("20"), Decimal("150.10"), now=1.5)
+        md.on_trade(BUY, Decimal("30"), Decimal("150.10"), now=2.0)
+        md.on_trade(SELL, Decimal("10"), Decimal("149.90"), now=2.5)
+
+        # TFI in 5s window: (50 buy - 10 sell) / 60 = +0.6666
+        tfi = md.trade_flow_imbalance(5.0, now=3.0)
+        self.assertAlmostEqual(float(tfi), 0.6666, places=3)
+
+    # 7. OrderManager Single Place & Atomic Batch Replace
+    async def test_07_ordermanager_batch_replace(self):
+        ex = Exchange(self.cfg, lambda *a: None)
+        fills = []
+        om = OrderManager(self.cfg, ex, self.signer, lambda: self.mock_market, lambda s, p, q, o: fills.append((s, p, q)))
+
+        # Place initial quote
+        o1 = await om.place(0, BUY, Decimal("149.00"), Decimal("0.1"), now=1.0)
+        self.assertIsNotNone(o1)
+        self.assertEqual(len(om.orders), 1)
+        self.assertIn((0, BUY), om.pair_slots)
+
+        # Perform atomic batch replacement: cancel o1 and place new BUY and SELL quotes
+        places = [
+            (0, BUY, Decimal("149.50"), Decimal("0.15"), False),
+            (0, SELL, Decimal("150.50"), Decimal("0.15"), False),
+        ]
+        replaced = await om.batch_replace([o1], places, now=2.0)
+
+        self.assertEqual(len(replaced), 2)
+        self.assertEqual(len(om.orders), 2)
+        self.assertNotIn(o1.order_id, om.orders)
+        self.assertEqual(om.pair_slots[(0, BUY)], replaced[0].order_id)
+        self.assertEqual(om.pair_slots[(0, SELL)], replaced[1].order_id)
+
+    # 8. Sweep Guard Fill Protection
+    async def test_08_sweep_guard_cooldown(self):
+        ex = Exchange(self.cfg, lambda *a: None)
+        ledger = Ledger(self.cfg)
+        from bot import MarketMaker
+
+        mm = MarketMaker(self.cfg)
+        mm.md.info = self.mock_market
+        mm.md.update(Decimal("149.90"), Decimal("150.10"), Decimal("50"), Decimal("50"), now=1.0)
+
+        o_buy = await mm.om.place(0, BUY, Decimal("149.50"), Decimal("0.1"), now=1.0)
+        
+        # Simulate 2 rapid fills within 1.0 second on BUY side
+        mm._on_fill(BUY, Decimal("0.1"), Decimal("149.50"), o_buy)
+        mm._on_fill(BUY, Decimal("0.1"), Decimal("149.50"), o_buy)
+
+        self.assertTrue(mm._burst_blocked_until[BUY] > mm.now())
+
+    # 9. Taker Speed Bump Advantage in Quoting
+    def test_09_speed_bump_advantage(self):
+        engine = MarketMakingEngine(self.cfg)
+        self.assertTrue(self.cfg.taker_speed_bump_enabled)
+        self.assertEqual(self.cfg.speed_bump_advantage_bps, Decimal("1.5"))
+
+    # 10. Ledger PnL & Markout Tracking
+    def test_10_ledger_accounting_and_pnl(self):
+        ledger = Ledger(self.cfg)
+        # Buy 1.0 SOL @ 150.00
+        f1 = ledger.record_fill(BUY, Decimal("1.0"), Decimal("150.00"), Decimal("150.00"), now=1.0)
+        self.assertEqual(ledger.position, Decimal("1.0"))
+        self.assertEqual(ledger.avg_cost, Decimal("150.00"))
+
+        # Mark price moves to 155.00
+        unreal = ledger.unrealized(Decimal("155.00"))
+        self.assertEqual(unreal, Decimal("5.00"))
+
+        # Sell 1.0 SOL @ 156.00
+        f2 = ledger.record_fill(SELL, Decimal("1.0"), Decimal("156.00"), Decimal("155.00"), now=5.0)
+        self.assertEqual(ledger.position, Decimal("0.0"))
+        self.assertEqual(ledger.realized, Decimal("6.00"))
+        self.assertEqual(ledger.total_pnl(Decimal("156.00")), Decimal("6.00"))
+
+
+
+    # 11. WebSocket-First State Queries & Low-Latency Socket Tuning
+    async def test_11_websocket_first_and_socket_tuning(self):
+        ex = Exchange(self.cfg, lambda *a: None)
+        
+        # Test socket optimization helper (TCP_NODELAY)
+        class MockSocket:
+            def __init__(self):
+                self.opts = {}
+            def setsockopt(self, level, optname, value):
+                self.opts[optname] = value
+
+        mock_sock = MockSocket()
+        ex.optimize_socket(mock_sock)
+        import socket
+        self.assertEqual(mock_sock.opts.get(socket.TCP_NODELAY), 1)
+
+        # Verify markets fetch works over WebSocket / cached fallback
+        markets = await ex.fetch_markets("SOL-USD")
+        self.assertTrue(len(markets) >= 1)
+        self.assertEqual(markets[0]["symbol"], "SOL-USD")
+
+    # 12. Ultra-Low Latency Signing Microbenchmark
+    def test_12_sub_millisecond_signing_latency(self):
+        import time
+        action = self.signer.build_limit_action("SOL-USD", BUY, Decimal("150.00"), Decimal("0.1"), "ALO")
+        
+        # Warmup
+        for _ in range(50):
+            self.signer.sign_transaction([action])
+
+        # Benchmark 500 signatures
+        t0 = time.perf_counter()
+        N = 500
+        for _ in range(N):
+            env, oids = self.signer.sign_transaction([action])
+        t1 = time.perf_counter()
+        avg_us = ((t1 - t0) / N) * 1_000_000
+        print(f"\nAverage Ed25519 signing latency: {avg_us:.2f} microseconds per transaction")
+        self.assertLess(avg_us, 500.0, "Signing latency must be sub-millisecond (< 500 us)")
 
 
 if __name__ == "__main__":

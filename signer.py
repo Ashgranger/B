@@ -1,634 +1,281 @@
+"""Bulk Trade Ed25519 Signer & Transaction Envelope Builder.
+
+Implements Solana Ed25519 signing, signature domains, canonical serialization,
+pre-computed optimistic Order IDs, Builder Codes, and atomic batch transactions.
+"""
 from __future__ import annotations
 
-def _unpack_sign_result(res: Any) -> tuple[Optional[int], Any, Optional[str]]:
-    """Safely unpack result from lighter SDK sign_* methods (supports 2, 3, or 4 item returns)."""
-    if isinstance(res, (tuple, list)):
-        if len(res) >= 4:
-            return res[0], res[1], res[3]
-        elif len(res) == 3:
-            return res[0], res[1], res[2]
-        elif len(res) == 2:
-            return None, res[0], res[1]
-    return None, None, f"Unexpected return type from signer: {type(res)}"
-
-"""Request signing and transaction construction per Lighter Perpetual DEX & Robinhood Chain docs."""
-
-
 import hashlib
-import hmac
 import json
-import logging
+import struct
 import time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from market import Market
-from utils import canonical, fmt, to_lighter_int, Fatal
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
-log = logging.getLogger("signer")
+from utils import (
+    b58decode,
+    b58encode,
+    canonical,
+    fmt,
+    to_fixed_u64,
+    BUY,
+    SELL,
+    Fatal,
+)
 
-# --- Lighter Protocol Constants (ported from lighter-go / txtypes / constants.go) --- #
-TX_TYPE_CHANGE_PUB_KEY = 8
-TX_TYPE_CREATE_SUB_ACCOUNT = 9
-TX_TYPE_CREATE_PUBLIC_POOL = 10
-TX_TYPE_UPDATE_PUBLIC_POOL = 11
-TX_TYPE_TRANSFER = 12
-TX_TYPE_WITHDRAW = 13
-TX_TYPE_CREATE_ORDER = 14
-TX_TYPE_CANCEL_ORDER = 15
-TX_TYPE_CANCEL_ALL_ORDERS = 16
-TX_TYPE_MODIFY_ORDER = 17
-TX_TYPE_UPDATE_LEVERAGE = 20
-TX_TYPE_CREATE_GROUPED_ORDERS = 28
-TX_TYPE_UPDATE_MARGIN = 29
 
-# Order Types
-ORDER_TYPE_LIMIT = 0
-ORDER_TYPE_MARKET = 1
-ORDER_TYPE_STOP_LOSS = 2
-ORDER_TYPE_STOP_LOSS_LIMIT = 3
-ORDER_TYPE_TAKE_PROFIT = 4
-ORDER_TYPE_TAKE_PROFIT_LIMIT = 5
-ORDER_TYPE_TWAP = 6
+class SignatureDomain:
+    MAINNET = 1
+    TESTNET = 2
+    DEVNET = 3
 
-# Time In Force (TIF)
-TIF_IOC = 0         # Immediate or Cancel
-TIF_GTT = 1         # Good till Time
-TIF_POST_ONLY = 2   # Post-Only / ALO (Add Liquidity Only / Maker Only)
-
-# Side
-SIDE_BUY = 0
-SIDE_SELL = 1
-
-# Cancel All Time In Force
-CANCEL_ALL_IMMEDIATE = 0
-CANCEL_ALL_SCHEDULED = 1   # Dead Man's Switch (Scheduled cancel all)
-CANCEL_ALL_ABORT = 2
-
-# Self Trade Behavior
-STB_EXPIRE_MAKER = 0
-STB_EXPIRE_TAKER = 1
-STB_EXPIRE_BOTH = 2
-STB_REDUCE = 3
-
-# Order Status
-STATUS_IN_PROGRESS = 0
-STATUS_PENDING = 1
-STATUS_ACTIVE_LIMIT = 2
-STATUS_FILLED = 3
-STATUS_CANCELED = 4
-STATUS_CANCELED_POST_ONLY = 5
-STATUS_CANCELED_REDUCE_ONLY = 6
-STATUS_CANCELED_EXPIRED = 12
+    @classmethod
+    def from_str(cls, s: str) -> int:
+        clean = (s or "").strip().lower()
+        if clean in ("mainnet", "1"):
+            return cls.MAINNET
+        if clean in ("testnet", "2"):
+            return cls.TESTNET
+        if clean in ("devnet", "3"):
+            return cls.DEVNET
+        return cls.MAINNET
 
 
 class Signer:
-    # Class-level mappings for backward compatibility
-    OP_PLACE = TX_TYPE_CREATE_ORDER
-    OP_CANCEL = TX_TYPE_CANCEL_ORDER
-    OP_MODIFY = TX_TYPE_MODIFY_ORDER
-    SIDE = {"BUY": SIDE_BUY, "SELL": SIDE_SELL, "bid": SIDE_BUY, "ask": SIDE_SELL}
-    TIF_IOC = TIF_IOC
-    TIF_GTT = TIF_GTT
-    TIF_POST_ONLY = TIF_POST_ONLY
-    TIF_ALO = TIF_POST_ONLY
-    TIF_FOK = TIF_IOC
-    TIF_GTC = TIF_GTT
+    """High-performance Ed25519 signer for Bulk Trade Perp DEX."""
 
-    def __init__(self, key_hex: str, address: str, account_index: int = 0, api_key_index: int = 4,
-                 url: str = "https://api.rh.lighter.xyz"):
-        self.key_hex = key_hex.removeprefix("0x").lower()
-        self.address = address
-        self.addr_lc = address.lower()
-        self.account_index = int(account_index)
-        self.api_key_index = int(api_key_index)
-        self.url = url
-        self.ai = self.account_index
+    # Time-In-Force (TIF)
+    TIF_ALO = "ALO"  # Add Liquidity Only (Post-Only)
+    TIF_GTC = "GTC"  # Good 'Til Cancelled
+    TIF_IOC = "IOC"  # Immediate Or Cancel
+    TIF_FOK = "FOK"  # Fill Or Kill
 
-        self._nonce = 0
-        self._nonce_initialized = False
-        self._client_order_seq = int(time.time() * 1000) % (2 ** 32)
-        self._last_ts = 0
-
-        self._pub_key_hex = ""
-        self._priv = None
-        self._lighter_client = None
-        self._init_keys()
-
-    def _init_keys(self) -> None:
+    def __init__(
+        self,
+        private_key: Union[str, bytes],
+        account: Optional[str] = None,
+        domain: int = SignatureDomain.MAINNET,
+        builder_to: Optional[str] = None,
+        builder_fee_bps: int = 0,
+    ):
+        """
+        Initialize the Bulk Trade Signer.
+        :param private_key: Base58 string or 32-byte seed or 64-byte keypair
+        :param account: Base58 Solana address of the trading/sub-account (defaults to signer pubkey)
+        :param domain: SignatureDomain (1=Mainnet, 2=Testnet, 3=Devnet)
+        :param builder_to: Optional builder code recipient address
+        :param builder_fee_bps: Optional builder fee in bps (1..15)
+        """
+        self.domain = domain
+        self._priv = self._load_private_key(private_key)
+        self._pub = self._priv.public_key()
+        self.pubkey_bytes = self._pub.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        self.pubkey_b58 = b58encode(self.pubkey_bytes)
+        
+        # Account is either provided or defaults to the signer public key
+        self.account_b58 = (account or "").strip() or self.pubkey_b58
         try:
-            raw_bytes = bytes.fromhex(self.key_hex)
+            self.account_bytes = b58decode(self.account_b58)
         except Exception:
-            raw_bytes = self.key_hex.encode()
+            self.account_bytes = self.pubkey_bytes
+            self.account_b58 = self.pubkey_b58
 
-        # 1. Try native lighter SDK SignerClient if available
-        try:
-            import lighter
-            self._lighter_client = lighter.SignerClient(
-                url=self.url,
-                api_private_keys={self.api_key_index: self.key_hex},
-                account_index=self.account_index,
-            )
-            log.info("Initialized native Lighter SignerClient successfully (API Key Index %d)", self.api_key_index)
-        except Exception as e:
-            self._lighter_client = None
-            log.debug("Native Lighter SignerClient not loaded (%s); using pure-Python engine", e)
+        self.builder_to = builder_to.strip() if builder_to else None
+        self.builder_fee_bps = int(builder_fee_bps) if builder_fee_bps else 0
+        self._last_nonce = 0
 
-        # 2. Key derivation for tests and pure-Python execution
-        try:
-            from cryptography.hazmat.primitives.asymmetric import ed25519
-            from cryptography.hazmat.primitives import serialization
-            # If 40 bytes (80 hex chars, Robinhood Lighter native key), derive 32-byte seed
-            seed = raw_bytes if len(raw_bytes) == 32 else hashlib.sha256(raw_bytes).digest()
-            priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
-            pub = priv.public_key()
-            self._pub_key_hex = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
-            self._priv = priv
-        except Exception:
-            h = hashlib.sha256(raw_bytes).hexdigest()
-            self._pub_key_hex = h
-            self._priv = None
+    @classmethod
+    def generate(cls, domain: int = SignatureDomain.MAINNET) -> "Signer":
+        """Generate a fresh random keypair for testing or initialization."""
+        priv = ed25519.Ed25519PrivateKey.generate()
+        raw_seed = priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        return cls(raw_seed, domain=domain)
 
-    @property
-    def priv(self):
-        """Getter for internal key pair (for verification in tests)."""
-        return self._priv
+    def _load_private_key(self, k: Union[str, bytes]) -> ed25519.Ed25519PrivateKey:
+        raw_bytes: bytes
+        if isinstance(k, str):
+            clean = k.strip()
+            if len(clean) == 64:  # Hex string
+                try:
+                    raw_bytes = bytes.fromhex(clean)
+                except ValueError:
+                    raw_bytes = b58decode(clean)
+            else:
+                raw_bytes = b58decode(clean)
+        elif isinstance(k, bytes):
+            raw_bytes = k
+        else:
+            raise Fatal(f"Unsupported private key format: {type(k)}")
 
-    @property
-    def api_key(self) -> str:
-        return self._pub_key_hex
-
-    def set_nonce(self, next_nonce: int) -> None:
-        """Synchronize with exchange GET /api/v1/nextNonce."""
-        self._nonce = max(self._nonce, int(next_nonce))
-        self._nonce_initialized = True
+        if len(raw_bytes) == 32:
+            return ed25519.Ed25519PrivateKey.from_private_bytes(raw_bytes)
+        elif len(raw_bytes) == 64:
+            # First 32 bytes is seed in Solana/NaCl keypair representation
+            seed = raw_bytes[:32]
+            return ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+        else:
+            raise Fatal(f"Invalid private key byte length: {len(raw_bytes)} (expected 32 or 64)")
 
     def next_nonce(self) -> int:
-        """Get the next sequential nonce for this API key."""
-        n = self._nonce
-        self._nonce += 1
-        return n
+        """Monotonic nanosecond timestamp nonce."""
+        now_ns = time.time_ns()
+        self._last_nonce = max(now_ns, self._last_nonce + 1)
+        return self._last_nonce
 
-    def next_client_order_index(self) -> int:
-        """Generate a unique uint48 client order index (≤ 2^48 - 1)."""
-        self._client_order_seq += 1
-        now_ms = int(time.time() * 1000) & 0xFFFFFFFFFF
-        return ((now_ms % 1000000) * 10000 + (self._client_order_seq % 10000)) & 0xFFFFFFFFFFFF
-
-    def next_ts(self) -> int:
-        self._last_ts = max(time.time_ns(), self._last_ts + 1)
-        return self._last_ts
-
-    def sign_hash(self, message: bytes) -> str:
-        """Generate signature for transaction payload."""
-        if self._priv is not None:
-            try:
-                return self._priv.sign(message).hex()
-            except Exception:
-                pass
-        try:
-            raw_bytes = bytes.fromhex(self.key_hex)
-        except Exception:
-            raw_bytes = self.key_hex.encode()
-        return hmac.new(raw_bytes, message, hashlib.sha256).hexdigest()
-
-    def create_auth_token(self, deadline_s: int = 28800) -> str:
-        """Generate an auth token for private WebSocket channels and REST queries."""
-        if self._lighter_client is not None:
-            try:
-                token, err = self._lighter_client.create_auth_token_with_expiry(
-                    deadline=deadline_s,
-                    api_key_index=self.api_key_index
-                )
-                if not err and token:
-                    return str(token)
-            except Exception as e:
-                log.warning("native create_auth_token error: %s", e)
-
-        exp = int(time.time()) + deadline_s
-        payload = f"{self.addr_lc}:{self.account_index}:{self.api_key_index}:{exp}"
-        sig = self.sign_hash(payload.encode())
-        return f"{payload}:{sig}"
-
-    def place(self, m: Market, side: str, px: Decimal, qty: Decimal, good_til_us: int,
-              time_in_force: str = "ALO", reduce_only: bool = False,
-              client_order_index: Optional[int] = None) -> dict:
+    def compute_order_id(self, action: dict, nonce: int, seqno: int = 0) -> str:
         """
-        Construct and sign a Limit/Market Order on Robinhood Lighter perpetual DEX.
-        Maps time_in_force:
-          'IOC' -> TIF_IOC (0)
-          'GTT' / 'GTC' -> TIF_GTT (1)
-          'ALO' / 'POST_ONLY' -> TIF_POST_ONLY (2)
+        Compute deterministic pre-computed Order ID for optimistic tracking.
+        Hashing: sha256(domain (1B) + account (32B) + nonce (8B LE) + seqno (4B LE) + canonical_action).
         """
-        tif_str = time_in_force.upper()
-        if tif_str in ("IOC", "0"):
-            tif_code = TIF_IOC
-            order_type = ORDER_TYPE_LIMIT
-            order_expiry = 0
-        elif tif_str in ("GTT", "GTC", "1"):
-            tif_code = TIF_GTT
-            order_type = ORDER_TYPE_LIMIT
-            order_expiry = max(int(time.time() * 1000) + 300_000, int(good_til_us / 1000))
-        else:  # ALO / POST_ONLY / 2
-            tif_code = TIF_POST_ONLY
-            order_type = ORDER_TYPE_LIMIT
-            order_expiry = max(int(time.time() * 1000) + 300_000, int(good_til_us / 1000))
+        action_bytes = canonical(action).encode("utf-8")
+        h = hashlib.sha256()
+        h.update(struct.pack("<B", self.domain))
+        h.update(self.account_bytes)
+        h.update(struct.pack("<Q", nonce))
+        h.update(struct.pack("<I", seqno))
+        h.update(action_bytes)
+        return b58encode(h.digest())
 
-        is_ask = SIDE_SELL if side.upper() in ("SELL", "ASK") else SIDE_BUY
-        c_order_idx = client_order_index if client_order_index is not None else self.next_client_order_index()
-        nonce = self.next_nonce()
+    def attach_builder_code(self, action_body: dict) -> dict:
+        """Attach optional builder code attribution if configured."""
+        if self.builder_to and 1 <= self.builder_fee_bps <= 15:
+            action_body["builderCode"] = {
+                "to": self.builder_to,
+                "fee": self.builder_fee_bps,
+            }
+        return action_body
 
-        price_decimals = getattr(m, "price_decimals", 2)
-        size_decimals = getattr(m, "size_decimals", 4)
-        int_price = to_lighter_int(px, price_decimals)
-        int_base_amount = to_lighter_int(qty, size_decimals)
-
-        # Delegate to native Lighter SDK signer if available
-        if self._lighter_client is not None:
-            try:
-                sign_res = self._lighter_client.sign_create_order(
-                    market_index=m.market_id,
-                    client_order_index=c_order_idx,
-                    base_amount=int_base_amount,
-                    price=int_price,
-                    is_ask=bool(is_ask),
-                    order_type=order_type,
-                    time_in_force=tif_code,
-                    reduce_only=bool(reduce_only),
-                    trigger_price=0,
-                    order_expiry=order_expiry,
-                    nonce=nonce,
-                    api_key_index=self.api_key_index,
-                )
-                tx_type, tx_info, err = _unpack_sign_result(sign_res)
-                if not err and tx_info:
-                    return {
-                        "type": "placeOrder",
-                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CREATE_ORDER,
-                        "tx_info": tx_info,
-                        "clientOrderIndex": c_order_idx,
-                        "orderId": str(c_order_idx),
-                        "payload": {
-                            "address": self.address, "accountIndex": self.account_index, "apiKeyIndex": self.api_key_index,
-                            "marketId": m.market_id, "clientOrderIndex": c_order_idx, "orderSide": side.upper(),
-                            "isAsk": bool(is_ask), "quantity": fmt(qty), "price": fmt(px), "timeInForce": "post-only" if tif_code == TIF_POST_ONLY else "immediate-or-cancel",
-                            "reduceOnly": bool(reduce_only), "nonce": nonce, "tx_type": TX_TYPE_CREATE_ORDER, "tx_info": tx_info
-                        },
-                        "apiKey": self.api_key,
-                        "signature": "",
-                        "timestamp": str(self.next_ts()),
-                    }
-            except Exception as e:
-                log.debug("Native sign_create_order fallback to python: %s", e)
-
-        # Pure-Python signer
-        tx_info = {
-            "AccountIndex": self.account_index,
-            "ApiKeyIndex": self.api_key_index,
-            "MarketIndex": m.market_id,
-            "ClientOrderIndex": c_order_idx,
-            "BaseAmount": int_base_amount,
-            "Price": int_price,
-            "IsAsk": is_ask,
-            "OrderType": order_type,
-            "TimeInForce": tif_code,
-            "ReduceOnly": 1 if reduce_only else 0,
-            "TriggerPrice": 0,
-            "OrderExpiry": order_expiry,
-            "Nonce": nonce,
-            "SelfTradeBehaviorMode": STB_EXPIRE_MAKER,
-            "SelfTradeEqualityMode": 0,
-        }
-
-        canonical_info = canonical(tx_info)
-        sig = self.sign_hash(canonical_info.encode())
-        tx_info["Sig"] = sig
-
+    def build_limit_action(
+        self,
+        market_symbol: str,
+        side: str,
+        price: Decimal,
+        qty: Decimal,
+        time_in_force: str = "ALO",
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Construct a Bulk Trade limit order action payload ('l').
+        """
+        is_buy = (side == BUY)
+        p_float = float(price)
+        sz_float = float(qty)
+        
         body = {
-            "address": self.address,
-            "accountIndex": self.account_index,
-            "apiKeyIndex": self.api_key_index,
-            "marketId": m.market_id,
-            "clientOrderIndex": c_order_idx,
-            "orderSide": side.upper(),
-            "isAsk": bool(is_ask),
-            "orderType": "limit" if order_type == ORDER_TYPE_LIMIT else "market",
-            "timeInForce": "post-only" if tif_code == TIF_POST_ONLY else ("immediate-or-cancel" if tif_code == TIF_IOC else "good-till-time"),
-            "quantity": fmt(qty),
-            "price": fmt(px),
-            "reduceOnly": bool(reduce_only),
-            "orderExpiry": order_expiry,
-            "nonce": nonce,
-            "tx_type": TX_TYPE_CREATE_ORDER,
-            "tx_info": tx_info,
+            "c": market_symbol,
+            "b": is_buy,
+            "p": p_float,
+            "sz": sz_float,
+            "r": bool(reduce_only),
+            "tif": time_in_force,
         }
+        if client_order_id:
+            body["cid"] = client_order_id
 
-        return {
-            "type": "placeOrder",
-            "tx_type": TX_TYPE_CREATE_ORDER,
-            "tx_info": tx_info,
-            "payload": body,
-            "clientOrderIndex": c_order_idx,
-            "orderId": str(c_order_idx),
-            "apiKey": self.api_key,
-            "signature": sig,
-            "timestamp": str(self.next_ts()),
-        }
+        self.attach_builder_code(body)
+        return {"l": body}
 
-    def modify(self, m: Market, order_id: str | int, side: str, px: Decimal, qty: Decimal,
-               good_til_us: int, reduce_only: bool = False, order_version: int = 0) -> dict:
-        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "").replace("sim-", "") or 0)
-        nonce = self.next_nonce()
-
-        price_decimals = getattr(m, "price_decimals", 2)
-        size_decimals = getattr(m, "size_decimals", 4)
-        int_price = to_lighter_int(px, price_decimals)
-        int_base_amount = to_lighter_int(qty, size_decimals)
-
-        if self._lighter_client is not None:
-            try:
-                sign_res = self._lighter_client.sign_modify_order(
-                    market_index=m.market_id,
-                    order_index=c_order_idx,
-                    base_amount=int_base_amount,
-                    price=int_price,
-                    trigger_price=0,
-                    order_version=order_version,
-                    nonce=nonce,
-                    api_key_index=self.api_key_index,
-                )
-                tx_type, tx_info, err = _unpack_sign_result(sign_res)
-                if not err and tx_info:
-                    return {
-                        "type": "modifyOrder",
-                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_MODIFY_ORDER,
-                        "tx_info": tx_info,
-                        "payload": {"marketId": m.market_id, "orderId": str(order_id), "price": fmt(px), "quantity": fmt(qty), "tx_type": TX_TYPE_MODIFY_ORDER},
-                        "orderId": str(order_id),
-                        "clientOrderIndex": c_order_idx,
-                        "apiKey": self.api_key,
-                        "signature": "",
-                        "timestamp": str(self.next_ts()),
-                    }
-            except Exception as e:
-                log.debug("Native sign_modify_order fallback: %s", e)
-
-        tx_info = {
-            "AccountIndex": self.account_index,
-            "ApiKeyIndex": self.api_key_index,
-            "MarketIndex": m.market_id,
-            "ClientOrderIndex": c_order_idx,
-            "BaseAmount": int_base_amount,
-            "Price": int_price,
-            "TriggerPrice": 0,
-            "OrderVersion": order_version,
-            "Nonce": nonce,
-        }
-
-        canonical_info = canonical(tx_info)
-        sig = self.sign_hash(canonical_info.encode())
-        tx_info["Sig"] = sig
-
+    def build_market_action(
+        self,
+        market_symbol: str,
+        side: str,
+        qty: Decimal,
+        reduce_only: bool = False,
+        ioc: bool = True,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Construct a Bulk Trade market order action payload ('m').
+        """
+        is_buy = (side == BUY)
+        sz_float = float(qty)
         body = {
-            "address": self.address,
-            "accountIndex": self.account_index,
-            "apiKeyIndex": self.api_key_index,
-            "marketId": m.market_id,
-            "orderId": str(order_id),
-            "clientOrderIndex": c_order_idx,
-            "side": side.upper(),
-            "quantity": fmt(qty),
-            "price": fmt(px),
-            "timeInForce": "post-only",
-            "reduceOnly": bool(reduce_only),
-            "nonce": nonce,
-            "tx_type": TX_TYPE_MODIFY_ORDER,
-            "tx_info": tx_info,
+            "c": market_symbol,
+            "b": is_buy,
+            "sz": sz_float,
+            "r": bool(reduce_only),
+            "i": bool(ioc),
         }
+        if client_order_id:
+            body["cid"] = client_order_id
 
-        return {
-            "type": "modifyOrder",
-            "tx_type": TX_TYPE_MODIFY_ORDER,
-            "tx_info": tx_info,
-            "payload": body,
-            "orderId": str(order_id),
-            "clientOrderIndex": c_order_idx,
-            "apiKey": self.api_key,
-            "signature": sig,
-            "timestamp": str(self.next_ts()),
+        self.attach_builder_code(body)
+        return {"m": body}
+
+    def build_cancel_action(self, order_id: str, market_symbol: str = "") -> dict:
+        """Construct a Bulk Trade cancel action payload ('c')."""
+        body = {"order_id": order_id}
+        if market_symbol:
+            body["c"] = market_symbol
+        return {"c": body}
+
+    def build_cancel_all_action(self, market_symbol: str = "") -> dict:
+        """Construct a Bulk Trade cancel-all action payload ('cancelAll')."""
+        body = {}
+        if market_symbol:
+            body["c"] = market_symbol
+        return {"cancelAll": body}
+
+    def sign_transaction(
+        self, actions: List[dict], nonce: Optional[int] = None
+    ) -> Tuple[dict, List[str]]:
+        """
+        Create a fully signed Bulk Trade transaction envelope for single or batch actions.
+        Returns: (signed_envelope, precomputed_order_ids)
+        """
+        if not actions:
+            raise ValueError("Actions list cannot be empty")
+        
+        tx_nonce = nonce if nonce is not None else self.next_nonce()
+
+        # Compute order IDs for order placement actions
+        order_ids = []
+        for seqno, act in enumerate(actions):
+            if "l" in act or "m" in act:
+                oid = self.compute_order_id(act, tx_nonce, seqno)
+                order_ids.append(oid)
+            else:
+                order_ids.append("")
+
+        # Create canonical message payload for Ed25519 signing
+        # Format conforms to Bulk Trade canonical signing format
+        msg_payload = {
+            "domain": self.domain,
+            "account": self.account_b58,
+            "signer": self.pubkey_b58,
+            "nonce": tx_nonce,
+            "actions": actions,
         }
+        canonical_bytes = canonical(msg_payload).encode("utf-8")
+        
+        # Ed25519 signature
+        signature_raw = self._priv.sign(canonical_bytes)
+        signature_b58 = b58encode(signature_raw)
 
-    def cancel(self, m: Market, order_id: str | int) -> dict:
-        c_order_idx = int(str(order_id).replace("dry-", "").replace("ord-", "").replace("sim-", "") or 0)
-        nonce = self.next_nonce()
-
-        if self._lighter_client is not None:
-            try:
-                sign_res = self._lighter_client.sign_cancel_order(
-                    market_index=m.market_id,
-                    order_index=c_order_idx,
-                    nonce=nonce,
-                    api_key_index=self.api_key_index,
-                )
-                tx_type, tx_info, err = _unpack_sign_result(sign_res)
-                if not err and tx_info:
-                    return {
-                        "type": "cancelOrder",
-                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ORDER,
-                        "tx_info": tx_info,
-                        "payload": {"marketId": m.market_id, "orderId": str(order_id), "clientOrderIndex": c_order_idx, "tx_type": TX_TYPE_CANCEL_ORDER},
-                        "orderId": str(order_id),
-                        "clientOrderIndex": c_order_idx,
-                        "apiKey": self.api_key,
-                        "signature": "",
-                        "timestamp": str(self.next_ts()),
-                    }
-            except Exception as e:
-                log.debug("Native sign_cancel_order fallback: %s", e)
-
-        tx_info = {
-            "AccountIndex": self.account_index,
-            "ApiKeyIndex": self.api_key_index,
-            "MarketIndex": m.market_id,
-            "ClientOrderIndex": c_order_idx,
-            "Nonce": nonce,
+        envelope = {
+            "actions": actions,
+            "nonce": tx_nonce,
+            "account": self.account_b58,
+            "signer": self.pubkey_b58,
+            "signature": signature_b58,
+            "order_ids": [oid for oid in order_ids if oid],
         }
+        return envelope, order_ids
 
-        canonical_info = canonical(tx_info)
-        sig = self.sign_hash(canonical_info.encode())
-        tx_info["Sig"] = sig
-
-        body = {
-            "address": self.address,
-            "accountIndex": self.account_index,
-            "apiKeyIndex": self.api_key_index,
-            "marketId": m.market_id,
-            "orderId": str(order_id),
-            "clientOrderIndex": c_order_idx,
-            "nonce": nonce,
-            "tx_type": TX_TYPE_CANCEL_ORDER,
-            "tx_info": tx_info,
-        }
-
-        return {
-            "type": "cancelOrder",
-            "tx_type": TX_TYPE_CANCEL_ORDER,
-            "tx_info": tx_info,
-            "payload": body,
-            "orderId": str(order_id),
-            "clientOrderIndex": c_order_idx,
-            "apiKey": self.api_key,
-            "signature": sig,
-            "timestamp": str(self.next_ts()),
-        }
-
-    def schedule_cancel(self, m: Market, deadline_us: Optional[int]) -> dict:
-        nonce = self.next_nonce()
+    def schedule_cancel(self, m: Any, deadline_us: Optional[int]) -> dict:
+        """Bulk Trade Dead Man's Switch / Schedule Cancel."""
+        act = {"scheduleCancel": {"c": getattr(m, "name", str(m))}}
         if deadline_us is not None:
-            tif = CANCEL_ALL_SCHEDULED
-            expiry_ms = int(deadline_us / 1000)
-        else:
-            tif = CANCEL_ALL_ABORT
-            expiry_ms = 0
-
-        if self._lighter_client is not None:
-            try:
-                sign_res = self._lighter_client.sign_cancel_all_orders(
-                    time_in_force=tif,
-                    timestamp_ms=expiry_ms,
-                    cancel_all_market_index=m.market_id,
-                    nonce=nonce,
-                    api_key_index=self.api_key_index,
-                )
-                tx_type, tx_info, err = _unpack_sign_result(sign_res)
-                if not err and tx_info:
-                    return {
-                        "type": "scheduleCancel",
-                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ALL_ORDERS,
-                        "tx_info": tx_info,
-                        "payload": {"marketId": m.market_id, "timeInForce": tif, "deadline_ms": expiry_ms, "tx_type": TX_TYPE_CANCEL_ALL_ORDERS},
-                        "apiKey": self.api_key,
-                        "signature": "",
-                        "timestamp": str(self.next_ts()),
-                    }
-            except Exception as e:
-                log.debug("Native sign_schedule_cancel fallback: %s", e)
-
-        tx_info = {
-            "AccountIndex": self.account_index,
-            "ApiKeyIndex": self.api_key_index,
-            "MarketIndex": m.market_id,
-            "TimeInForce": tif,
-            "CancelAllTime": expiry_ms,
-            "Nonce": nonce,
-        }
-
-        canonical_info = canonical(tx_info)
-        sig = self.sign_hash(canonical_info.encode())
-        tx_info["Sig"] = sig
-
-        body = {
-            "address": self.address,
-            "accountIndex": self.account_index,
-            "apiKeyIndex": self.api_key_index,
-            "marketId": m.market_id,
-            "timeInForce": tif,
-            "deadline_ms": expiry_ms,
-            "nonce": nonce,
-            "tx_type": TX_TYPE_CANCEL_ALL_ORDERS,
-            "tx_info": tx_info,
-        }
-
-        return {
-            "type": "scheduleCancel",
-            "tx_type": TX_TYPE_CANCEL_ALL_ORDERS,
-            "tx_info": tx_info,
-            "payload": body,
-            "apiKey": self.api_key,
-            "signature": sig,
-            "timestamp": str(self.next_ts()),
-        }
-
-    def cancel_all(self, m: Market, immediate: bool = True) -> dict:
-        nonce = self.next_nonce()
-        tif = CANCEL_ALL_IMMEDIATE if immediate else CANCEL_ALL_SCHEDULED
-        if self._lighter_client is not None:
-            try:
-                sign_res = self._lighter_client.sign_cancel_all_orders(
-                    time_in_force=tif,
-                    timestamp_ms=0,
-                    cancel_all_market_index=m.market_id,
-                    nonce=nonce,
-                    api_key_index=self.api_key_index,
-                )
-                tx_type, tx_info, err = _unpack_sign_result(sign_res)
-                if not err and tx_info:
-                    return {
-                        "type": "cancelAllOrders",
-                        "tx_type": int(tx_type) if tx_type is not None else TX_TYPE_CANCEL_ALL_ORDERS,
-                        "tx_info": tx_info,
-                        "payload": {"marketId": m.market_id, "timeInForce": tif, "tx_type": TX_TYPE_CANCEL_ALL_ORDERS},
-                        "apiKey": self.api_key,
-                        "signature": "",
-                        "timestamp": str(self.next_ts()),
-                    }
-            except Exception as e:
-                log.debug("Native sign_cancel_all fallback: %s", e)
-
-        tx_info = {
-            "AccountIndex": self.account_index,
-            "ApiKeyIndex": self.api_key_index,
-            "MarketIndex": m.market_id,
-            "TimeInForce": tif,
-            "CancelAllTime": 0,
-            "Nonce": nonce,
-        }
-        canonical_info = canonical(tx_info)
-        sig = self.sign_hash(canonical_info.encode())
-        tx_info["Sig"] = sig
-
-        body = {
-            "address": self.address,
-            "accountIndex": self.account_index,
-            "marketId": m.market_id,
-            "timeInForce": CANCEL_ALL_IMMEDIATE,
-            "nonce": nonce,
-            "tx_type": TX_TYPE_CANCEL_ALL_ORDERS,
-            "tx_info": tx_info,
-        }
-
-        return {
-            "type": "cancelAllOrders",
-            "tx_type": TX_TYPE_CANCEL_ALL_ORDERS,
-            "tx_info": tx_info,
-            "payload": body,
-            "apiKey": self.api_key,
-            "signature": sig,
-            "timestamp": str(self.next_ts()),
-        }
-
-    def legacy(self, action: str, body: dict) -> dict:
-        ts = self.next_ts()
-        message = f"{ts}{action}{canonical(body)}"
-        return {
-            "type": action,
-            "payload": body,
-            "apiKey": self.api_key,
-            "timestamp": str(ts),
-            "signature": self.sign_hash(message.encode()),
-        }
-
-    async def close(self) -> None:
-        """Cleanly close native lighter SDK client session if initialized."""
-        if self._lighter_client is not None:
-            try:
-                import inspect
-                close_fn = getattr(self._lighter_client, "close", None)
-                if inspect.iscoroutinefunction(close_fn):
-                    await close_fn()
-                elif callable(close_fn):
-                    res = close_fn()
-                    if inspect.isawaitable(res):
-                        await res
-            except Exception as e:
-                log.debug("SignerClient close note: %s", e)
+            act["scheduleCancel"]["deadline"] = int(deadline_us)
+        envelope, _ = self.sign_transaction([act])
+        return {"type": "scheduleCancel", "payload": envelope}

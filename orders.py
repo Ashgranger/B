@@ -1,4 +1,4 @@
-"""Order book of *our own* orders with Multi-Pair Individual Order Management on Robinhood Lighter."""
+"""Order management for Bulk Trade: Atomic batching, pre-computed IDs, and ALO quoting."""
 from __future__ import annotations
 
 import asyncio
@@ -8,15 +8,23 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Optional, Dict, Tuple, List
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff, q_down, q_up
+from utils import (
+    BUY,
+    SELL,
+    ZERO,
+    ONE,
+    bps_diff,
+    fmt,
+    q_down,
+    q_up,
+)
 
 log = logging.getLogger("orders")
-GTT_DAYS = 28
 
 
 @dataclass
@@ -27,7 +35,6 @@ class Order:
     price: Decimal
     qty: Decimal
     remaining: Decimal
-    good_til_us: int
     created: float
     last_action: float
     filled_any: bool = False
@@ -37,20 +44,30 @@ class Order:
     ev_bps: Decimal = Decimal(0)
     quote_mid: Optional[Decimal] = None
     est_px: Optional[Decimal] = None
-    client_order_index: Optional[int] = None
+    client_order_id: Optional[str] = None
 
 
 class OrderManager:
-    def __init__(self, cfg, ex: Exchange, signer: Signer, get_market: Callable[[], Market],
-                 on_fill: Callable[[str, Decimal, Decimal, Order], None]):
-        self.cfg, self.ex, self.signer = cfg, ex, signer
+    """Manages local order lifecycle and atomic Bulk Trade mutations."""
+
+    def __init__(
+        self,
+        cfg,
+        ex: Exchange,
+        signer: Signer,
+        get_market: Callable[[], Market],
+        on_fill: Callable[[str, Decimal, Decimal, Order], None],
+    ):
+        self.cfg = cfg
+        self.ex = ex
+        self.signer = signer
         self.get_market = get_market
         self.on_fill = on_fill
 
-        self.orders: dict[str, Order] = {}
-        self._last_taker: dict = {}
-        self.pair_slots: dict[Tuple[int, str], str] = {}
-        self._unmatched: dict[str, tuple] = {}
+        self.orders: Dict[str, Order] = {}
+        self.pair_slots: Dict[Tuple[int, str], str] = {}  # (pair_index, side) -> order_id
+        self._last_taker: Dict[str, float] = {}
+        self._unmatched: Dict[str, tuple] = {}
         self.reject_until = {BUY: 0.0, SELL: 0.0}
         self._reject_n = {BUY: 0, SELL: 0}
         self._actions: deque = deque()
@@ -59,25 +76,19 @@ class OrderManager:
         self._consec_errors = 0
         self.last_place_ts = 0.0
         self.maybe_orders = True
-        self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
-    async def _resync_nonce(self) -> None:
-        if getattr(self, "_resyncing", False):
-            return
-        self._resyncing = True
-        try:
-            n = await self.ex.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
-            if n is not None and n >= 0:
-                self.signer.set_nonce(n)
-                log.info("Auto-resynchronized nonce with exchange: %d", n)
-                self._consec_errors = 0
-        except Exception as e:
-            log.debug("Auto-resync nonce note: %s", e)
-        finally:
-            self._resyncing = False
+        self.n_place = 0
+        self.n_modify = 0
+        self.n_cancel = 0
+        self.n_reject = 0
+        self.n_actions = 0
 
-    def side_orders(self, side: str) -> list[Order]:
-        return sorted((o for o in self.orders.values() if o.side == side), key=lambda o: o.price, reverse=(side == BUY))
+    def side_orders(self, side: str) -> List[Order]:
+        return sorted(
+            (o for o in self.orders.values() if o.side == side),
+            key=lambda o: o.price,
+            reverse=(side == BUY),
+        )
 
     def get_order_by_slot(self, pair_index: int, side: str) -> Optional[Order]:
         oid = self.pair_slots.get((pair_index, side))
@@ -97,9 +108,10 @@ class OrderManager:
         return " | ".join(desc) if desc else "none"
 
     def _budget(self, now: float) -> bool:
+        max_rate = getattr(self.cfg, "max_actions_per_min", 240)
         while self._actions and now - self._actions[0] > 60:
             self._actions.popleft()
-        if len(self._actions) >= self.cfg.max_actions_per_min:
+        if len(self._actions) >= max_rate:
             return False
         self._actions.append(now)
         self.n_actions += 1
@@ -107,22 +119,17 @@ class OrderManager:
 
     @staticmethod
     def _ok(resp: dict) -> bool:
-        if not isinstance(resp, dict):
-            return False
-        code = resp.get("code") or resp.get("status")
-        return code in (200, 202) and "error" not in resp
+        return resp.get("status") in (200, 202) and "error" not in resp
 
     def _error(self, what: str, resp: dict, now: float) -> None:
-        err = resp.get("error") if isinstance(resp, dict) else str(resp)
-        status = resp.get("status") or resp.get("code")
-        log.warning("%s failed: status=%s %s", what, status, json.dumps(err, default=str)[:300])
+        err = resp.get("error")
+        log.warning("%s failed: status=%s %s", what, resp.get("status"), json.dumps(err)[:200])
         self._consec_errors += 1
         retry = err.get("retryAfterMs") if isinstance(err, dict) else None
-        retry = retry or (resp.get("retryAfterMs") if isinstance(resp, dict) else None)
-        if status == 429 and retry:
+        if resp.get("status") == 429 and retry:
             self.paused_until = now + float(retry) / 1000 + 0.1
         if self._consec_errors >= 8:
-            log.error("too many consecutive errors - pausing 30s")
+            log.error("Too many consecutive errors - pausing 30s")
             self.paused_until = now + 30
             self._consec_errors = 0
 
@@ -130,14 +137,23 @@ class OrderManager:
         self._reject_n[side] += 1
         self.reject_until[side] = now + min(0.25 * 2 ** (self._reject_n[side] - 1), 4.0)
 
-    async def place(self, pair_index: int, side: str, px: Decimal, qty: Decimal, now: float,
-                    time_in_force: str = "ALO", reduce_only: bool = False,
-                    quote_mid: Optional[Decimal] = None,
-                    est_px: Optional[Decimal] = None) -> Optional[Order]:
+    async def place(
+        self,
+        pair_index: int,
+        side: str,
+        px: Decimal,
+        qty: Decimal,
+        now: float,
+        time_in_force: str = "ALO",
+        reduce_only: bool = False,
+        quote_mid: Optional[Decimal] = None,
+        est_px: Optional[Decimal] = None,
+    ) -> Optional[Order]:
+        """Place single order on Bulk Trade."""
         if now < self.paused_until or not self._budget(now):
             return None
         m = self.get_market()
-        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+        tick = m.tick_for(px)
         is_taker = (time_in_force == "IOC")
         if is_taker:
             px = q_up(px, tick) if side == BUY else q_down(px, tick)
@@ -147,82 +163,69 @@ class OrderManager:
         if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
             return None
 
-        good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(m, side, px, qty, good_til,
-                                time_in_force=time_in_force, reduce_only=reduce_only)
+        act = self.signer.build_limit_action(
+            m.name, side, px, qty, time_in_force=time_in_force, reduce_only=reduce_only
+        )
+        envelope, oids = self.signer.sign_transaction([act])
+        pre_oid = oids[0]
+
+        req = {"type": "order", "payload": envelope}
         self.maybe_orders = True
         self.last_place_ts = now
-        # Direct WebSocket transmission via jsonapi/sendtx
         resp = await self.ex.write(req)
         res = resp.get("result") or {}
-        code = resp.get("code") or resp.get("status")
-        if not self._ok(resp) or str(res.get("status", "")).upper() == "REJECTED":
-            self._error(f"place L{pair_index} {side}", resp if not self._ok(resp) else
-                        {"status": code, "error": res}, now)
-            err_code = resp.get("code") if isinstance(resp, dict) else (res.get("code") if isinstance(res, dict) else None)
-            err_msg = str(resp).lower()
-            if err_code == 21104 or "invalid nonce" in err_msg:
-                await self._resync_nonce()
+
+        if not self._ok(resp) or str(res.get("status")).upper() == "REJECTED":
+            self._error(f"place L{pair_index} {side}", resp, now)
             if not is_taker:
                 self._backoff(side, now)
             return None
 
         self._consec_errors = 0
         self.n_place += 1
-        oid = str(res.get("orderId") or req.get("clientOrderIndex") or req.get("orderId"))
-        c_idx = req.get("clientOrderIndex")
-
-        o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
-                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid,
-                  est_px=est_px, client_order_index=c_idx)
+        oid = str(res.get("orderId") or pre_oid)
+        o = Order(
+            oid, pair_index, side, px, qty, qty, now, now,
+            is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px
+        )
         self.orders[oid] = o
-        if c_idx is not None:
-            self.orders[str(c_idx)] = o
         if not is_taker:
             self.pair_slots[(pair_index, side)] = oid
-
-        log.info("PLACE L%d %s %s @ %s (taker=%s, oid=%s)", pair_index, side, fmt(qty), fmt(px), is_taker, oid)
-        early = self._unmatched.pop(oid, None) or (self._unmatched.pop(str(c_idx), None) if c_idx else None)
+        log.info("PLACE L%d %s %s @ %s (id=%s, taker=%s)", pair_index, side, fmt(qty), fmt(px), oid[:8], is_taker)
+        
+        early = self._unmatched.pop(oid, None)
         if early:
             self._apply(o, early[1], now)
         return o
 
-    async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False,
-                     reduce_only: Optional[bool] = None) -> bool:
-        if now < self.paused_until or not self._budget(now):
-            if urgent:
-                await self.cancel(o, now)
-            return False
-        m = self.get_market()
-        tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
-        px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
-        r_only = o.is_reduce_only if reduce_only is None else reduce_only
-        req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
-        # Direct WebSocket transmission
-        resp = await self.ex.write(req)
-        if not self._ok(resp):
-            self._error(f"modify L{o.pair_index} {o.side}", resp, now)
-            err_code = resp.get("code") if isinstance(resp, dict) else None
-            err_msg = str(resp).lower()
-            if err_code == 21104 or "invalid nonce" in err_msg:
-                await self._resync_nonce()
-            await self.cancel(o, now)
-            return False
-        self._consec_errors = 0
-        self.n_modify += 1
-        log.info("MODIFY L%d %s %s -> %s (reduce_only=%s)", o.pair_index, o.side, fmt(o.price), fmt(px), r_only)
-        o.price, o.last_action, o.is_reduce_only = px, now, r_only
-        return True
+    async def place_taker(
+        self, side: str, px: Decimal, qty: Decimal, now: float, reduce_only: bool = True
+    ) -> Optional[Order]:
+        """Execute an immediate IOC taker order (unwind or liquidation cut)."""
+        return await self.place(
+            pair_index=-1,
+            side=side,
+            px=px,
+            qty=qty,
+            now=now,
+            time_in_force="IOC",
+            reduce_only=reduce_only,
+        )
 
     async def cancel(self, o: Order, now: float) -> None:
+        """Cancel a resting order on Bulk Trade."""
         if o.cancelling_since is not None and now - o.cancelling_since < 5:
             return
         o.cancelling_since = now
         self._recently_closed.append((now, o.order_id))
         self._budget(now)
-        req = self.signer.cancel(self.get_market(), o.order_id)
-        # Direct WebSocket transmission
+
+        m = self.get_market()
+        act = self.signer.build_cancel_action(o.order_id, m.name)
+        envelope, _ = self.signer.sign_transaction([act])
+        req = {"type": "cancel", "payload": envelope}
         resp = await self.ex.write(req)
+
         if self.cfg.dry_run or "ORDER_NOT_FOUND" in json.dumps(resp):
             self._remove_order(o.order_id)
         elif not self._ok(resp):
@@ -231,79 +234,144 @@ class OrderManager:
         else:
             self.n_cancel += 1
 
-    def _remove_order(self, order_id: str) -> None:
-        o = self.orders.pop(order_id, None)
-        if o:
-            if o.client_order_index is not None:
-                self.orders.pop(str(o.client_order_index), None)
-            self._recently_closed.append((time.time(), order_id))
-            slot = (o.pair_index, o.side)
-            if self.pair_slots.get(slot) == order_id or (o.client_order_index and self.pair_slots.get(slot) == str(o.client_order_index)):
-                self.pair_slots.pop(slot, None)
-
-    async def _gather(self, coros) -> None:
-        coros = list(coros)
-        if not coros:
-            return
-        for c in coros:
-            try:
-                await c
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning("order action failed: %r", e)
-
     async def cancel_side(self, side: str, now: float) -> None:
-        coros = []
-        for slot, oid in list(self.pair_slots.items()):
-            if slot[1] == side:
-                o = self.orders.get(oid)
-                if o:
-                    coros.append(self.cancel(o, now))
-        await self._gather(coros)
+        """Cancel all orders on a given side."""
+        for o in self.side_orders(side):
+            await self.cancel(o, now)
 
-    async def cancel_all(self, force: bool = False) -> None:
-        """Cancel all resting orders directly over WebSocket (TxTypeL2CancelAllOrders = 16)."""
-        if not force and not self.orders and not self.maybe_orders:
+    async def cancel_all(self, now: float = 0.0, force: bool = False, reason: str = "") -> None:
+        """Cancel all resting orders on Bulk Trade."""
+        if not self.orders:
             return
         m = self.get_market()
-        now = time.time()
-        # 1. Cancel tracked local orders
-        await self._gather([self.cancel(o, now) for o in list(self.orders.values())])
+        log.info("CANCEL ALL: %s (%d active orders)", reason, len(self.orders))
+        act = self.signer.build_cancel_all_action(m.name)
+        envelope, _ = self.signer.sign_transaction([act])
+        req = {"type": "cancelAll", "payload": envelope}
+        await self.ex.write(req)
+        for oid in list(self.orders.keys()):
+            self._remove_order(oid)
+        self.n_cancel += 1
 
-        # 2. Issue a batch cancelAll directly over WebSocket to instantly wipe exchange book
-        if (force or self.maybe_orders) and not self.cfg.dry_run and getattr(self.ex, "is_connected", False):
-            try:
-                req = self.signer.cancel_all(m, immediate=True)
-                await self.ex.write(req)
-                log.info("Sent WebSocket cancel_all for market %s (id %d)", m.name, m.market_id)
-            except Exception as e:
-                log.debug("WebSocket cancel_all note: %s", e)
+    async def modify(
+        self, o: Order, px: Decimal, now: float, urgent: bool = False, reduce_only: Optional[bool] = None
+    ) -> bool:
+        """Modify/replace an existing order."""
+        if now < self.paused_until or not self._budget(now):
+            if urgent:
+                await self.cancel(o, now)
+            return False
+        
+        # In Bulk Trade, we can perform an atomic cancel + place
+        m = self.get_market()
+        tick = m.tick_for(px)
+        px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
+        r_only = o.is_reduce_only if reduce_only is None else reduce_only
 
-        self.orders.clear()
-        self.pair_slots.clear()
-        self.maybe_orders = False
+        if self.cfg.batch_replace_enabled:
+            replaced = await self.batch_replace([o], [(o.pair_index, o.side, px, o.remaining, r_only)], now)
+            return len(replaced) > 0
+        else:
+            await self.cancel(o, now)
+            new_o = await self.place(o.pair_index, o.side, px, o.remaining, now, "ALO", r_only)
+            return new_o is not None
 
-    async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[set] = None) -> None:
+    async def batch_replace(
+        self,
+        cancels: List[Order],
+        places: List[Tuple[int, str, Decimal, Decimal, bool]],  # (pair_idx, side, px, qty, reduce_only)
+        now: float,
+    ) -> List[Order]:
+        """
+        Execute atomic Bulk Trade batch transaction: bundle cancels and places together.
+        Sign once, transmit once, executed in a single atomic match step!
+        """
+        if not cancels and not places:
+            return []
+        if now < self.paused_until or not self._budget(now):
+            return []
+
+        m = self.get_market()
+        actions = []
+        # Add cancel actions first
+        for c in cancels:
+            c.cancelling_since = now
+            actions.append(self.signer.build_cancel_action(c.order_id, m.name))
+
+        # Add place actions
+        place_meta = []
+        for pair_idx, side, px, qty, r_only in places:
+            tick = m.tick_for(px)
+            px = q_down(px, tick) if side == BUY else q_up(px, tick)
+            qty = q_down(qty, m.step)
+            if qty >= m.min_size:
+                act = self.signer.build_limit_action(m.name, side, px, qty, "ALO", r_only)
+                actions.append(act)
+                place_meta.append((pair_idx, side, px, qty, r_only))
+
+        if not actions:
+            return []
+
+        envelope, oids = self.signer.sign_transaction(actions)
+        req = {"type": "batch_order", "payload": envelope}
+        resp = await self.ex.write(req)
+
+        if not self._ok(resp):
+            self._error("batch_replace", resp, now)
+            return []
+
+        # Cleanup cancels locally
+        for c in cancels:
+            self._remove_order(c.order_id)
+            self.n_cancel += 1
+
+        # Register placed orders
+        placed_orders = []
+        place_oids = [oid for oid in oids if oid]
+        for (pair_idx, side, px, qty, r_only), oid in zip(place_meta, place_oids):
+            o = Order(
+                order_id=oid,
+                pair_index=pair_idx,
+                side=side,
+                price=px,
+                qty=qty,
+                remaining=qty,
+                created=now,
+                last_action=now,
+                is_taker=False,
+                is_reduce_only=r_only,
+            )
+            self.orders[oid] = o
+            self.pair_slots[(pair_idx, side)] = oid
+            placed_orders.append(o)
+            self.n_place += 1
+            log.info("BATCH PLACE L%d %s %s @ %s (id=%s)", pair_idx, side, fmt(qty), fmt(px), oid[:8])
+
+        return placed_orders
+
+    async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[Set[str]] = None) -> None:
+        """Synchronize active market maker quotes with generated ladder targets."""
         active_slots = set()
-        groups: dict = {}
+        groups: Dict[Tuple[int, str], list] = {}
         for t in targets:
             slot = (t.pair_index, t.side)
             groups.setdefault(slot, []).append(t)
             if not getattr(t, "is_taker", False):
                 active_slots.add(slot)
 
-        async def run_group(ts: list) -> None:
+        coros = []
+        for slot, ts in groups.items():
             for t in ts:
-                await self._sync_one(t, now)
+                coros.append(self._sync_one(t, now))
 
-        coros = [run_group(ts) for ts in groups.values()]
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
                 o = self.orders.get(oid)
                 if o:
                     coros.append(self.cancel(o, now))
-        await self._gather(coros)
+
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
 
     async def _sync_one(self, t, now: float) -> None:
         slot = (t.pair_index, t.side)
@@ -317,18 +385,22 @@ class OrderManager:
             if existing:
                 await self.cancel(existing, now)
                 self.pair_slots.pop(slot, None)
-            await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                             time_in_force="IOC", reduce_only=True,
-                             quote_mid=getattr(t, "quote_mid", None),
-                             est_px=getattr(t, "est_px", None))
+            await self.place(
+                t.pair_index, t.side, t.price, t.qty, now,
+                time_in_force="IOC", reduce_only=True,
+                quote_mid=getattr(t, "quote_mid", None),
+                est_px=getattr(t, "est_px", None),
+            )
             return
 
         is_exit = bool(getattr(t, "is_exit_quote", False))
         if existing is None:
             if now >= self.reject_until[t.side]:
-                o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                                         time_in_force="ALO", reduce_only=is_exit,
-                                         quote_mid=getattr(t, "quote_mid", None))
+                o_new = await self.place(
+                    t.pair_index, t.side, t.price, t.qty, now,
+                    time_in_force="ALO", reduce_only=is_exit,
+                    quote_mid=getattr(t, "quote_mid", None),
+                )
                 if o_new:
                     o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             return
@@ -346,17 +418,14 @@ class OrderManager:
 
         m = self.get_market()
         tick_bps = (m.tick / existing.price) * Decimal("10000") if existing.price > 0 else Decimal("0.1")
-        eff_retreat = max(self.cfg.retreat_bps, tick_bps)
-        eff_requote = max(self.cfg.requote_bps, tick_bps)
+        eff_retreat = min(self.cfg.spread_min_bps, tick_bps * Decimal("0.9"))
+        eff_requote = min(self.cfg.spread_base_bps, tick_bps * Decimal("0.9"))
 
-        if is_retreating and (drift >= eff_retreat or (drift >= tick_bps and (now - existing.last_action >= 1.0))):
+        if is_retreating and (drift >= eff_retreat or abs(t.price - existing.price) >= m.tick):
             should_modify = True
             urgent = True
-        elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick) and (now - existing.last_action >= (getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s)):
-            queue_reset_cost = getattr(self.cfg, "queue_reset_cost_bps", Decimal("0.20"))
-            ev_gain = getattr(t, "expected_value_bps", Decimal(0)) - getattr(existing, "ev_bps", Decimal(0))
-            if ev_gain >= queue_reset_cost or drift >= (self.cfg.requote_bps * Decimal("1.5")) or abs(t.price - existing.price) >= m.tick:
-                should_modify = True
+        elif is_advancing and (drift >= eff_requote or abs(t.price - existing.price) >= m.tick):
+            should_modify = True
 
         if should_modify:
             if await self.modify(existing, t.price, now, urgent=urgent, reduce_only=is_exit):
@@ -364,27 +433,11 @@ class OrderManager:
                 existing.quote_mid = getattr(t, "quote_mid", None)
 
     def on_update(self, c: dict, now: float) -> None:
-        if not isinstance(c, dict):
+        """Handle incoming order update from exchange stream."""
+        if not isinstance(c, dict) or not (c.get("orderId") or c.get("id")):
             return
-        mkt_id = c.get("market_index") or c.get("marketId") or c.get("m")
-        if mkt_id is not None:
-            try:
-                if int(mkt_id) != self.get_market().market_id:
-                    return
-            except Exception:
-                pass
-
-        oid = str(c.get("client_order_id") or c.get("client_order_index") or c.get("u") or
-                  c.get("order_id") or c.get("order_index") or c.get("i") or c.get("orderId") or c.get("id") or "")
-        if not oid:
-            return
-
+        oid = str(c.get("orderId") or c.get("id"))
         o = self.orders.get(oid)
-        if o is None and c.get("client_order_index"):
-            o = self.orders.get(str(c["client_order_index"]))
-        if o is None and c.get("order_index"):
-            o = self.orders.get(str(c["order_index"]))
-
         if o is None:
             self._unmatched[oid] = (now, c)
             if len(self._unmatched) > 200:
@@ -393,19 +446,12 @@ class OrderManager:
         self._apply(o, c, now)
 
     def _apply(self, o: Order, c: dict, now: float) -> None:
-        if c.get("cancelReason") == "MODIFY_CANCELED":
-            return
-        status_raw = str(c.get("status") or c.get("state") or "").lower()
-        raw_status_num = c.get("status")
-        
-        is_canceled = status_raw.startswith("canceled") or status_raw in ("rejected", "expired") or raw_status_num in (4, 5, 6, 7, 8, 9, 10, 11, 12)
-        filled = (status_raw == "filled" or status_raw == "3" or raw_status_num == 3)
-        
+        state = str(c.get("state") or c.get("status") or "").upper()
+        filled = (state == "FILLED")
         px = o.price
         try:
-            if c.get("price") or c.get("p"):
-                p_val = c.get("price") or c.get("p")
-                px = Decimal(str(p_val))
+            if c.get("price") or c.get("px"):
+                px = Decimal(str(c.get("price") or c.get("px")))
             for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"):
                 v = c.get(k)
                 if v and Decimal(str(v)) > 0:
@@ -414,99 +460,36 @@ class OrderManager:
         except Exception:
             pass
 
-        if o.is_taker and (filled or status_raw == "partially_filled"):
-            real = any(c.get(k) and Decimal(str(c[k])) > 0
-                       for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"))
-            log.info("TAKER_RAW limit=%s est=%s real_px_field=%s raw=%s", fmt(o.price), fmt(o.est_px) if o.est_px else "-",
-                     real, json.dumps(c, default=str)[:500])
-            if not real and o.est_px and getattr(self.cfg, "taker_fill_price_mode", "est") == "est":
-                px = o.est_px
-
-        m = self.get_market()
-        size_decimals = getattr(m, "size_decimals", 4) if m else 4
-        
-        cum_filled = None
-        if "filled_base_amount" in c and c["filled_base_amount"] is not None:
-            try:
-                d_val = Decimal(str(c["filled_base_amount"]))
-                if d_val > 0 and d_val == int(d_val) and d_val > o.qty:
-                    cum_filled = d_val / (Decimal(10) ** size_decimals)
-                else:
-                    cum_filled = d_val
-            except Exception:
-                cum_filled = None
-
         fill_qty = Decimal(0)
-        if cum_filled is not None:
-            if cum_filled > getattr(o, "filled_qty", Decimal(0)):
-                fill_qty = cum_filled - getattr(o, "filled_qty", Decimal(0))
-                o.filled_qty = cum_filled
-                o.remaining = max(Decimal(0), o.qty - o.filled_qty)
+        rem = c.get("remainingSize") or c.get("remaining_size")
+        if rem is not None:
+            try:
+                new_rem = Decimal(str(rem))
+                if new_rem < o.remaining:
+                    fill_qty = o.remaining - new_rem
+                o.remaining = new_rem
+            except Exception:
+                pass
         elif filled:
             fill_qty = o.remaining
             o.remaining = Decimal(0)
-            o.filled_qty = o.qty
-        elif not is_canceled:
-            rem = c.get("remaining_base_amount") or c.get("remainingSize") or c.get("rs")
-            if rem is not None:
-                try:
-                    raw_rem = Decimal(str(rem))
-                    if raw_rem > 0 and raw_rem == int(raw_rem) and raw_rem > o.qty:
-                        new_rem = raw_rem / (Decimal(10) ** size_decimals)
-                    else:
-                        new_rem = raw_rem
-                    if new_rem < o.remaining:
-                        fill_qty = o.remaining - new_rem
-                        o.remaining = new_rem
-                        o.filled_qty = getattr(o, "filled_qty", Decimal(0)) + fill_qty
-                except Exception:
-                    pass
 
-        # NEVER book a fill if the order was canceled without filled base amount
-        if fill_qty > 0 and not (is_canceled and (cum_filled == Decimal(0) or cum_filled is None and not o.filled_any)):
+        if fill_qty > 0:
             o.filled_any = True
-            log.info("FILL L%d %s %s @ %s (status=%s, oid=%s)", o.pair_index, o.side, fmt(fill_qty), fmt(px), status_raw, o.order_id)
             self.on_fill(o.side, fill_qty, px, o)
 
-        if status_raw in ("open", "2", "active") or raw_status_num == 2:
-            self._reject_n[o.side] = 0
-
-        # IOC terminal handling per Robinhood Lighter documentation
-        is_ioc_done = o.is_taker and (status_raw in ("partially_filled", "filled", "canceled", "expired", "rejected", "3", "4", "5", "6", "12") or
-                                     o.remaining == Decimal(0))
-
-        if filled or is_ioc_done:
-            self._remove_order(o.order_id)
-        elif is_canceled:
-            reason = c.get("rejectionReason") or c.get("cancelReason") or c.get("ae") or status_raw
-            if (status_raw in ("rejected", "margin_canceled") or raw_status_num in (7, 8, 9, 10)) and not o.is_taker:
-                self.n_reject += 1
-                self._backoff(o.side, now)
-            log.info("ORDER L%d %s CANCELED: %s", o.pair_index, o.side, reason)
+        if state in ("FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"):
             self._remove_order(o.order_id)
 
     async def reconcile(self, rows: list, now: float) -> None:
-        """Reconcile in-memory state against WebSocket orders snapshot."""
+        """Reconcile local order cache with exchange open order snapshot."""
         m = self.get_market()
-        market_rows = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            r_mkt = r.get("market_index") or r.get("marketId") or r.get("m")
-            if r_mkt is not None:
-                try:
-                    if int(r_mkt) != m.market_id:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            market_rows.append(r)
-
-        open_ids = {str(r.get("client_order_id") or r.get("client_order_index") or r.get("order_id") or r.get("order_index") or r.get("orderId") or r.get("id")) for r in market_rows}
+        open_ids = {str(r.get("orderId") or r.get("id")) for r in rows if isinstance(r, dict)}
         for o in list(self.orders.values()):
-            if o.order_id not in open_ids and (o.client_order_index is None or str(o.client_order_index) not in open_ids) and now - o.last_action > 5 and o.cancelling_since is None:
-                log.warning("dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
+            if o.order_id not in open_ids and now - o.last_action > 5 and o.cancelling_since is None:
+                log.warning("Dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
                 self._remove_order(o.order_id)
-
+        
         mine = set(self.orders)
         if now - self.last_place_ts < 3:
             return
@@ -515,6 +498,17 @@ class OrderManager:
         for oid in (open_ids - mine - recent_closed):
             if oid and oid != "None":
                 self._recently_closed.append((now, oid))
-                log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
-                reqs.append(self.ex.write(self.signer.cancel(m, oid)))
-        await self._gather(reqs)
+                log.warning("Cancelling orphan order %s for market %s", oid, m.name)
+                act = self.signer.build_cancel_action(oid, m.name)
+                envelope, _ = self.signer.sign_transaction([act])
+                reqs.append(self.ex.write({"type": "cancel", "payload": envelope}))
+        if reqs:
+            await asyncio.gather(*reqs, return_exceptions=True)
+
+    def _remove_order(self, order_id: str) -> None:
+        o = self.orders.pop(order_id, None)
+        if o:
+            self._recently_closed.append((time.time(), order_id))
+            slot = (o.pair_index, o.side)
+            if self.pair_slots.get(slot) == order_id:
+                self.pair_slots.pop(slot, None)

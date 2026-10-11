@@ -410,6 +410,11 @@ class OnlineLearner:
             return ZERO
         return self.markout_model.predict(side, regime, level, horizon)
 
+
+    def record_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
+                    min_notional: Decimal = Decimal("5.0"), is_maker: bool = True) -> Fill:
+        return self.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
+
     def on_fill(self, side: str, price: Decimal, mid: Decimal, pos_usd: Decimal, hold_s: float,
                 now: Optional[float] = None) -> None:
         """Adapts inventory skew, risk aversion, and fill-probability kappa upon execution."""
@@ -645,6 +650,10 @@ class Ledger:
     def avg_edge_bps(self) -> Decimal:
         return (self.spread_edge_bps_sum / self.n_fills) if self.n_fills else ZERO
 
+    def record_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
+                    min_notional: Decimal = Decimal("5.0"), is_maker: bool = True) -> Fill:
+        return self.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
+
     def on_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
                 min_notional: Decimal, is_maker: bool = True) -> Fill:
         signed = qty if side == BUY else -qty
@@ -813,24 +822,20 @@ class Ledger:
         avg_m = self._calc_weighted_markout(buf)
         return max(ZERO, -avg_m)
 
-    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal,
-                  force: bool = False, avg_cost: Optional[Decimal] = None) -> bool:
+    def reconcile(self, ex_pos: Decimal, now: float, mid: Decimal, min_notional: Decimal) -> bool:
         tol = (min_notional / mid) * Decimal("0.25") if mid else Decimal("1e-8")
-        if not force and abs(ex_pos - self.position) <= tol:
+        if abs(ex_pos - self.position) <= tol:
             self._mismatch = 0
             return False
-        if not force and now - self.last_fill_ts < 4.0:
+        if now - self.last_fill_ts < 4.0:
             return False
-        if not force:
-            self._mismatch += 1
-            if self._mismatch < 2:
-                return False
+        self._mismatch += 1
+        if self._mismatch < 2:
+            return False
         old = self.position
         self.position = ex_pos
         self._mismatch = 0
-        if avg_cost and avg_cost > ZERO:
-            self.avg_cost = avg_cost
-        elif old == 0 or (old > 0) != (ex_pos > 0) or self.avg_cost == 0:
+        if old == 0 or (old > 0) != (ex_pos > 0) or self.avg_cost == 0:
             self.avg_cost = mid
-        self.opened_ts = None if self.is_flat(mid, min_notional) else (self.opened_ts or now)
+        self.opened_ts = None if self.is_flat(mid, min_notional) else now
         return True
