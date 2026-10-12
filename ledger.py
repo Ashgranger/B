@@ -410,11 +410,6 @@ class OnlineLearner:
             return ZERO
         return self.markout_model.predict(side, regime, level, horizon)
 
-
-    def record_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
-                    min_notional: Decimal = Decimal("5.0"), is_maker: bool = True) -> Fill:
-        return self.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
-
     def on_fill(self, side: str, price: Decimal, mid: Decimal, pos_usd: Decimal, hold_s: float,
                 now: Optional[float] = None) -> None:
         """Adapts inventory skew, risk aversion, and fill-probability kappa upon execution."""
@@ -650,10 +645,6 @@ class Ledger:
     def avg_edge_bps(self) -> Decimal:
         return (self.spread_edge_bps_sum / self.n_fills) if self.n_fills else ZERO
 
-    def record_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
-                    min_notional: Decimal = Decimal("5.0"), is_maker: bool = True) -> Fill:
-        return self.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
-
     def on_fill(self, side: str, qty: Decimal, price: Decimal, mid: Decimal, now: float,
                 min_notional: Decimal, is_maker: bool = True) -> Fill:
         signed = qty if side == BUY else -qty
@@ -827,10 +818,12 @@ class Ledger:
         if abs(ex_pos - self.position) <= tol:
             self._mismatch = 0
             return False
-        if now - self.last_fill_ts < 4.0:
+        # Do not wipe internal position if fills occurred within the last 10s (delayed WS feed protection)
+        if now - self.last_fill_ts < 10.0:
             return False
         self._mismatch += 1
-        if self._mismatch < 2:
+        # Require at least 3 consecutive confirming mismatched updates
+        if self._mismatch < 3:
             return False
         old = self.position
         self.position = ex_pos
