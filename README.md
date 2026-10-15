@@ -1,116 +1,54 @@
-# Arcus Level 8+ Institutional Market Maker: Tight-Spread & Alpha-Driven Engine
+# Arcus Full Quantitative Market Maker on Robinhood Lighter Perp DEX (Level 7/8+)
 
-A high-frequency quantitative market-making system engineered for tight-spread perpetual DEXes and limit order books.
+A full 1:1 mirror of the Arcus Level 7/8+ institutional quantitative market-making system, engineered specifically for the **Robinhood Lighter Perpetual DEX** (`https://apidocs.rh.lighter.xyz/docs/get-started` & `https://apidocs.lighter.xyz/docs/lighter-rh`).
 
----
+## Robinhood Lighter Perp DEX Specifications Implemented
 
-## Architecture Overview
+| Parameter | Robinhood Lighter Mainnet (`mainnet` / `rh_mainnet`) | Robinhood Lighter Testnet (`testnet` / `rh_testnet`) |
+| :--- | :--- | :--- |
+| **REST API Base URL** | `https://api.rh.lighter.xyz` (`/api/v1/*`) | `https://api.rh-testnet.lighter.xyz` (`/api/v1/*`) |
+| **WebSocket Stream URL** | `wss://api.rh.lighter.xyz/stream` | `wss://api.rh-testnet.lighter.xyz/stream` |
+| **L2 Signing Chain ID** | `466324` | `300` |
+| **Settlement Collateral** | `USDG` (Asset Index `3`, 6 decimals) | `USDG` (Asset Index `3`, 6 decimals) |
+| **Available Bot API Key Indices** | `4–156` and `158–254` (`0–3` and `157` are reserved; `255` is query sentinel) | `4–156` and `158–254` |
+| **Account Tiers & Maker Latency** | Standard: `200ms` post-only maker latency; Premium (14d volume): `0ms` | Standard: `200ms`; Premium: `0ms` |
 
-```
-                               ┌─────────────────────────────────┐
-                               │   Market Ingestion & Ticks/L2   │
-                               └────────────────┬────────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-┌─────────────────────────────────┐                           ┌─────────────────────────────────┐
-│   Expanded Microstructure State │                           │   Cross-Exchange & Mark Alpha   │
-│ - Multi-horizon TFI (0.25s-10s) │                           │ - CEX Lead-Lag (Binance/Bybit)  │
-│ - Multi-depth OBI (L1, L5, L10) │                           │ - Reference Basis Reversion     │
-│ - Liquidity Fragility (1s flow) │                           │ - Funding Carry Direction       │
-│ - Flow Acceleration/Decel       │                           └────────────────┬────────────────┘
-└────────────────┬────────────────┘                                            │
-                 │                                                             │
-                 └──────────────────────────────┬──────────────────────────────┘
-                                                ▼
-                               ┌─────────────────────────────────┐
-                               │    Alpha-Aware Target Inv       │
-                               │  q_target = f(Alpha, Funding)   │
-                               │  ResPrice = f(Fair, q - q_targ) │
-                               └────────────────┬────────────────┘
-                                                │
-                                                ▼
-                               ┌─────────────────────────────────┐
-                               │  Selective-Touch Candidate Eval │
-                               │  - Touch vs 1-Tick vs Model     │
-                               │  - Queue Hazard Fill Prob P(H)  │
-                               │  - Empirical E[Markout|State]   │
-                               │  - One-Sided Steam Suppression  │
-                               └────────────────┬────────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-┌─────────────────────────────────┐                           ┌─────────────────────────────────┐
-│   Dynamic Maker Scratch Unwind  │                           │   Quote Opportunity Dataset     │
-│ - Time-decay target profit      │                           │ - State + Candidate Matrix      │
-│ - Zero maker fee queue priority │                           │ - Logs to quote_opps.jsonl      │
-│ - L2 VWAP Taker Book Walking    │                           │ - Walk-forward model training   │
-└─────────────────────────────────┘                           └─────────────────────────────────┘
-```
+### Core Protocol & Architecture Highlights
+1. **Zero-Guesswork Lighter L2 Transaction Signing (`signer.py`)**:
+   * Supports both the official `lighter-sdk` native C shared library (`lighter-signer-{os}-{arch}.so/.dylib/.dll`) and a built-in pure-Python deterministic signer & paper simulator.
+   * Implements exact Lighter L2 transaction types and JSON schemas:
+     * `TxTypeL2CreateOrder = 14` (`L2CreateOrderTxInfo`: `AccountIndex`, `ApiKeyIndex`, `MarketIndex`, `ClientOrderIndex`, `BaseAmount`, `Price`, `IsAsk`, `Type`, `TimeInForce`, `ReduceOnly`, `TriggerPrice`, `OrderExpiry`, `ExpiredAt`, `Nonce`, `Sig`).
+     * `TxTypeL2CancelOrder = 15` (`L2CancelOrderTxInfo`: single-order cancellation — **does not consume Lighter volume quota**).
+     * `TxTypeL2CancelAllOrders = 16` (`L2CancelAllOrdersTxInfo`: supports `CANCEL_ALL_TIF_IMMEDIATE = 0`, exchange-side Dead Man's Switch `CANCEL_ALL_TIF_SCHEDULED = 1` with millisecond deadline, and `CANCEL_ALL_TIF_ABORT = 2` to disarm).
+     * `TxTypeL2ModifyOrder = 17` (`L2ModifyOrderTxInfo`: in-place price/size modification).
+   * Enforces Lighter's strict Time-In-Force & Expiry rules:
+     * `ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0` (`IOC`) with `OrderExpiry = 0` (`DEFAULT_IOC_EXPIRY = 0` to prevent error `21711 invalid expiry`).
+     * `ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1` (`GTT`).
+     * `ORDER_TIME_IN_FORCE_POST_ONLY = 2` (`ALO` / `POST_ONLY`) with millisecond Unix timestamp `OrderExpiry`.
+   * Generates Lighter `Authorization` tokens (`{deadline_unix}:{account_index}:{api_key_index}:{sig_hex}`, max 8h expiry) for private REST endpoints and authenticated WebSocket feeds.
+2. **Incremental L2 Order Book Engine & Sequence Validation (`market.py` & `exchange.py`)**:
+   * Parses `/api/v1/orderBookDetails` (`market_id`, `symbol`, `status`, `price_decimals`, `size_decimals`, `min_base_amount`, `min_quote_amount`, `mark_price`, `current_funding_rate`).
+   * Scales prices by `10 ** price_decimals` and base sizes by `10 ** size_decimals`.
+   * Maintains full local L2 book state from `subscribed/order_book` snapshots and 50ms `update/order_book` deltas, deleting levels with `size == "0"` and verifying `begin_nonce == prev_nonce` continuity (automatically resubscribing on any sequence gap).
+3. **WebSocket + REST Dual Transport (`exchange.py`)**:
+   * Subscribes to `ticker/{market_id}`, `order_book/{market_id}`, `trade/{market_id}` (translating `is_maker_ask` to aggressor side), `market_stats/{market_id}`, and authenticated `account_orders/{market_id}/{account_index}`, `account_all_positions/{account_index}`, `account_all_trades/{account_index}`.
+   * Sends low-latency mutations via WebSocket `jsonapi/sendtx` and `jsonapi/sendtxbatch` with automatic HTTP `POST /api/v1/sendTx` (`application/x-www-form-urlencoded`) fallback.
+   * Tracks `volume_quota_remaining` and automatically resynchronizes nonces via `GET /api/v1/nextNonce` on code `21104` (`AppErrInvalidNonce`).
+4. **Full Level 2 / 3 / 4 / 7 / 8 Quantitative Intelligence (`engine.py`, `ledger.py`, `latent_state.py`, `level4_control.py`, `markout_model.py`, `meta_learner.py`, `optimizer.py`, `mean_field_competition.py`, `causal_impact.py`, `tail_risk_budget.py`)**:
+   * All quantitative alpha, POMDP belief-state quoting, empirical Bayesian markout modeling, selective-touch queue hazard evaluation, cross-exchange Binance/Bybit lead-lag defense, and L2 VWAP taker book-walking modules are preserved 1:1.
 
----
+## Quick Start
 
-## Key Modules & Implementations
-
-### 1. Empirical Bayesian Conditional Markout Model (`ledger.py`)
-Separates fill probability from post-fill returns:
-* Predicts $E[\text{Markout} \mid \text{Side}, \text{Regime}, \text{Level}, \text{Horizon}]$.
-* Applies Empirical Bayes shrinkage toward theoretical priors when sample sizes are small:
-  $$\hat{\mu} = \frac{N}{N + N_0} \bar{X} + \frac{N_0}{N + N_0} \mu_{\text{prior}}$$
-* Tracks multi-horizon post-fill markouts at $250\text{ms}, 500\text{ms}, 1\text{s}, 2\text{s}, 5\text{s}, 10\text{s},$ and $30\text{s}$.
-
-### 2. Expanded Microstructure Feature Pipeline (`market.py`)
-Computes high-frequency microstructure signals:
-* **Order Book Imbalance**: $\text{OBI}_{\text{L1}}$, $\text{OBI}_{\text{L5}}$, $\text{OBI}_{\text{L10}}$.
-* **Trade Flow Imbalance**: Rolling multi-horizon $\text{TFI}$ at $250\text{ms}, 500\text{ms}, 1\text{s}, 2\text{s}, 5\text{s},$ and $10\text{s}$.
-* **Flow Acceleration**: $\text{TFI}(1s) - \text{TFI}(5s)$ to distinguish surging momentum from decelerating flows.
-* **Depth Concentration**: Ratio of Level 0 touch depth to top-5 aggregate depth.
-* **Microprice Spread**: $(P_{\text{micro}} - P_{\text{mid}}) / P_{\text{mid}} \times 10{,}000$ (bps).
-* **Reference Basis**: $(P_{\text{mid}} - P_{\text{mark}}) / P_{\text{mark}} \times 10{,}000$ (bps).
-
-### 3. Liquidity Fragility Signal (`market.py` & `engine.py`)
-$$\text{Fragility} = \frac{\text{Aggressive Counter-Volume}_{1s}}{\text{Resting Depth}_{L1-L5}}$$
-When fragility exceeds `FRAGILITY_THRESHOLD` ($0.60$), the resting level is being actively consumed. The engine pulls touch quotes or shifts back 1 tick.
-
-### 4. Alpha-Aware & Funding-Aware Inventory Target (`engine.py`)
-Inventory is no longer a purely mean-reverting variable:
-$$q_{\text{target}} = \text{clamp}\left(\frac{\alpha_{\text{short-term}} + \text{Funding Carry}}{\gamma \cdot (1 + \sigma / 10)}, \; -q_{\text{max\_safe}}, \; +q_{\text{max\_safe}}\right)$$
-* In bullish regimes, positive inventory is tolerated.
-* When funding is positive (longs pay shorts), target inventory shifts short to harvest funding yield.
-* Reservation pricing skews relative to $(q - q_{\text{target}})$.
-
-### 5. One-Sided Touch Protection (`engine.py`)
-When `ENABLE_ONESIDED_TOUCH=1` and toxic flow is detected:
-* If aggressive buying surges ($\text{TFI} \ge 0.45$, flow bias $\ge 0.40$), touch asks are suppressed.
-* If aggressive selling surges ($\text{TFI} \le -0.45$, flow bias $\le -0.40$), touch bids are suppressed.
-
-### 6. Reversal & Absorption Mode (`market.py` & `engine.py`)
-Toggled via `ENABLE_ABSORPTION_MODE=1`:
-* **Momentum State**: Selling accelerates, book thins $\rightarrow$ avoid buying.
-* **Exhaustion State**: Selling volume was heavy but decelerates ($\text{TFI}_{\text{accel}} > 0.3$), opposite depth holds, price drop stalls $\rightarrow$ provides bid liquidity at favorable spreads.
-
-### 7. Quote Opportunity Dataset Logger (`bot.py`)
-When `ENABLE_QUOTE_DATASET=1`, writes every quoting decision to `quote_opportunities.jsonl`:
-* Full microstructure state snapshot.
-* Inventory, position, and PnL.
-* Evaluated candidate quotes, predicted fill probabilities, predicted markouts, and net EVs.
-* Execution decisions (PLACE, MODIFY, CANCEL, NO_QUOTE).
-
-### 8. L2 VWAP Order Book Walking for Taker Exits (`engine.py`)
-Replaces heuristic crossing assumptions:
-* Walks the live order book depth level-by-level to calculate exact VWAP and slippage.
-* Compares expected loss from waiting against actual crossing cost + taker fees.
-
----
-
-## Automated Verification Suite
-
-Run all 26 unit and simulation tests:
 ```bash
-python3 -m unittest test_level7.py
-```
-Run live or simulated trading:
-```bash
-python3 main.py --mode sim
-python3 main.py --mode live
+# 1. Run all 80 unit & integration tests (Quantitative + Robinhood Lighter Perp DEX)
+python3 -m unittest test_lighter_rh.py test_level7.py test_level4.py test_level8_level3.py
+
+# 2. Scan active Robinhood Lighter perp markets by spread vs volatility
+python3 main.py scan --env mainnet --seconds 30
+
+# 3. Paper-trade (DRY_RUN=1) on live Robinhood Lighter market data
+python3 main.py --env mainnet --market BTC
+
+# 4. Run live post-only market making on Robinhood Lighter Perp DEX
+python3 main.py --live --env mainnet --market BTC
 ```

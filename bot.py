@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from collections import deque
@@ -81,9 +82,18 @@ class MarketMaker:
         self.now = time.monotonic
         self.stop_evt = asyncio.Event()
 
-        self.ex = Exchange(cfg, self._on_channel)
         self.md = MarketData(cfg)
-        self.signer = Signer(cfg.signing_key, cfg.address, cfg.account_index)
+        self.signer = Signer(
+            cfg.signing_key,
+            cfg.address,
+            cfg.account_index,
+            api_key_index=getattr(cfg, "api_key_index", 4),
+            chain_id=getattr(cfg, "chain_id", 466324),
+            rest_url=getattr(cfg, "rest_url", "https://api.rh.lighter.xyz"),
+            skip_nonce=getattr(cfg, "skip_nonce", False),
+            signer_lib_path=getattr(cfg, "signer_lib_path", ""),
+        )
+        self.ex = Exchange(cfg, self._on_channel, signer=self.signer)
         self.ledger = Ledger(cfg)
         self.ledger.on_markout_cb = self._journal_markout
         self.md.own_provider = self._own_resting
@@ -91,6 +101,9 @@ class MarketMaker:
         self._pnl_base = ZERO
         self.engine = MarketMakingEngine(cfg)
         self.om = OrderManager(cfg, self.ex, self.signer, self._get_market, self._on_fill)
+        self.om.ledger = self.ledger
+        self.om.md = self.md
+        self.om.on_reduce_only_rejected = self._on_reduce_only_rejected
 
         self._recent_fills: deque = deque()
         self._burst_blocked_until = {BUY: 0.0, SELL: 0.0}
@@ -134,6 +147,8 @@ class MarketMaker:
                 bid_sz = Decimal(str(bb["size"])) if "size" in bb else None
                 ask_sz = Decimal(str(ba["size"])) if "size" in ba else None
                 self.md.update(bid, ask, bid_sz, ask_sz, now)
+                if self.cfg.dry_run:
+                    self.om.on_dry_bbo(bid, ask, now)
                 if self.md.mid:
                     self.ledger.process_markouts(self.md.mid, now)
                 self._dirty_evt.set()
@@ -155,6 +170,30 @@ class MarketMaker:
                 asks = contents.get("asks") or []
                 self.md.on_depth(bids, asks, now)
 
+        elif channel == "lighter_order_book":
+            if isinstance(contents, dict):
+                ok = self.md.apply_lighter_order_book(contents, is_snapshot, now)
+                if not ok and self.md.info and hasattr(self.ex, "resync_order_book"):
+                    self._spawn_bg("resync_ob", self.ex.resync_order_book, self.md.info.market_id)
+                else:
+                    if self.cfg.dry_run and self.md.bid and self.md.ask:
+                        self.om.on_dry_bbo(self.md.bid, self.md.ask, now)
+                    if self.md.mid:
+                        self.ledger.process_markouts(self.md.mid, now)
+                    self._dirty_evt.set()
+
+        elif channel == "market_stats":
+            if isinstance(contents, dict) and self.md.info:
+                mp = contents.get("mark_price") or contents.get("index_price")
+                if mp:
+                    try:
+                        d_mp = Decimal(str(mp))
+                        if d_mp > ZERO:
+                            self.md.info.mark = d_mp
+                            self.md.info_ts = now
+                    except Exception:
+                        pass
+
         elif channel in ("external_bbo", "cross_venue"):
             if isinstance(contents, dict):
                 venue = contents.get("venue", "EXTERNAL")
@@ -173,7 +212,16 @@ class MarketMaker:
                 self.om.on_update(contents, now)
             self._dirty_evt.set()
 
+        elif channel in ("userFills", "fills"):
+            rows = contents if isinstance(contents, list) else ([contents] if isinstance(contents, dict) else [])
+            for r in rows:
+                if isinstance(r, dict):
+                    self.om.on_user_fill(r, now)
+            self._dirty_evt.set()
+
         elif channel == "positions":
+            if self.cfg.dry_run:
+                return
             rows = extract_positions(contents)
             m = self.md.info
             if m:
@@ -217,9 +265,12 @@ class MarketMaker:
 
     def on_external_liq(self, venue: str, side: str, size: Decimal, price: Decimal) -> None:
         self.md.update_cross_liq(venue, side, size, price, self.now())
-        log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price,
-                    f"{float(size * price):,.0f}")
-        self._dirty_evt.set()
+        notional = float(size * price)
+        if notional >= 5000.0:
+            log.warning("LIQUIDATION %s forced-%s %s @ %s (~$%s)", venue, side, size, price, f"{notional:,.0f}")
+            self._dirty_evt.set()
+        else:
+            self._wake_throttled()
 
     def on_external_disconnect(self, venue: str) -> None:
         self.md.cross.drop_venue(venue)
@@ -232,6 +283,10 @@ class MarketMaker:
             px = Decimal(str(tr.get("price") or "0"))
             if sz > 0:
                 self.md.on_trade(side, sz, px, now)
+                if self.cfg.dry_run:
+                    self.om.on_dry_trade(side, sz, px, now)
+                    if self.md.mid:
+                        self.ledger.process_markouts(self.md.mid, now)
         except Exception:
             pass
 
@@ -240,10 +295,19 @@ class MarketMaker:
         m = self.md.info
         mid = getattr(o, "quote_mid", None) or self.md.mid or price
         min_notional = m.min_notional if m else Decimal("5")
-        
+
         is_maker = not getattr(o, "is_taker", False)
         fill = self.ledger.on_fill(side, qty, price, mid, now, min_notional, is_maker=is_maker)
         current_mid = self.md.mid or price
+
+        # Closed-loop Level 2/3/4 feedback on fill
+        notional_usd = float(qty * price)
+        try:
+            self.engine.impact_kernel.record_fill(side, notional_usd, now)
+            self.engine.meta_learner.record_fill(side, float(price), notional_usd, False, now)
+        except Exception:
+            pass
+
         log.info("FILL L%d %s %s @ %s | edge=%sbps pos=%s pnl=$%s ET=%s",
                  o.pair_index, side, fmt(qty), fmt(price), fmt(fill.edge_bps),
                  fmt(self.ledger.position), fmt(self.ledger.total_pnl(current_mid)),
@@ -257,11 +321,12 @@ class MarketMaker:
         except Exception:
             self._fill_ctx = {"level": o.pair_index, "et": et_hhmmss(time.time())}
 
+        l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
+        burst_win = l.burst_window_s if (l and hasattr(l, 'burst_window_s')) else self.cfg.burst_window_s
         self._recent_fills.append((now, side))
-        while self._recent_fills and now - self._recent_fills[0][0] > self.cfg.burst_window_s:
+        while self._recent_fills and now - self._recent_fills[0][0] > burst_win:
             self._recent_fills.popleft()
 
-        l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
         burst_limit = l.burst_fills if l else self.cfg.burst_fills
         burst_cooldown = l.burst_cooldown_s if l else self.cfg.burst_cooldown_s
         sweep_limit = l.sweep_guard_fills if l else self.cfg.sweep_guard_fills
@@ -271,7 +336,9 @@ class MarketMaker:
         if same_side >= burst_limit:
             self._burst_blocked_until[side] = now + burst_cooldown
             log.warning("BURST GUARD: %d %s fills in %.1fs -> pulling %s for %.1fs",
-                        same_side, side, self.cfg.burst_window_s, side, burst_cooldown)
+                        same_side, side, burst_win, side, burst_cooldown)
+            if l and hasattr(l, 'on_burst'):
+                l.on_burst(side, same_side, burst_win)
             asyncio.create_task(self.om.cancel_side(side, now))
 
         rapid_fills = sum(1 for t, s in self._recent_fills if s == side and (now - t) <= sweep_window)
@@ -279,6 +346,8 @@ class MarketMaker:
             self._burst_blocked_until[side] = max(self._burst_blocked_until[side], now + burst_cooldown)
             log.warning("SWEEP GUARD: %d %s fills in <=%.1fs -> emergency cancel %s",
                         rapid_fills, side, sweep_window, side)
+            if l and hasattr(l, 'on_sweep'):
+                l.on_sweep(side, rapid_fills, sweep_window)
             asyncio.create_task(self.om.cancel_side(side, now))
 
         self._journal(fill)
@@ -299,12 +368,12 @@ class MarketMaker:
                 pass
         self._files.clear()
 
-    def _spawn_bg(self, name: str, coro_fn, now: float) -> None:
+    def _spawn_bg(self, name: str, coro_fn, *args, **kwargs) -> None:
         """Run slow network housekeeping off the quoting loop (one in flight per name)."""
         t = self._bg_tasks.get(name)
         if t is not None and not t.done():
             return
-        self._bg_tasks[name] = asyncio.create_task(coro_fn(now))
+        self._bg_tasks[name] = asyncio.create_task(coro_fn(*args, **kwargs))
 
     def _journal(self, f: Fill) -> None:
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
@@ -329,13 +398,38 @@ class MarketMaker:
                 if not o.is_taker and o.cancelling_since is None and o.remaining > 0 and (now - o.created) >= age]
 
     def _journal_markout(self, f: Fill, horizon: float, m_bps) -> None:
-        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting."""
+        """Per-fill markout rows (join to fills on fill_ts) for offline conditional-EV fitting
+        and live closed-loop updates to Level 2/3/4 engines."""
+        m_val = float(m_bps)
+        try:
+            belief = self.md.belief_state
+            dom = belief.dominant_regime
+            regime_str = dom.value if hasattr(dom, "value") else str(dom)
+            self.engine.markout_model.record_realization(f.side, regime_str, horizon, m_val)
+            if abs(horizon - 1.0) < 0.25 or abs(horizon - 2.0) < 0.25:
+                pred_m, _ = self.engine.markout_model.predict_markout(f.side, belief, horizon)
+                self.engine.meta_learner.record_markout_prediction(float(pred_m), m_val)
+                if m_val < -0.5 and self.engine.meta_learner._fills_log:
+                    last_rec = self.engine.meta_learner._fills_log[-1]
+                    self.engine.meta_learner._fills_log[-1] = (
+                        last_rec[0], last_rec[1], last_rec[2], last_rec[3], True
+                    )
+                signed_sz = float(f.qty * f.price) * (1.0 if f.side == BUY else -1.0)
+                exog = float(self.md.obi) * 0.5 + float(self.md.trade_flow_imbalance(5.0, self.now())) * 0.5
+                self.engine.causal_estimator.record_outcome(
+                    signed_order_usd=signed_sz,
+                    observed_price_change_bps=-m_val if f.side == BUY else m_val,
+                    exogenous_signal_bps=exog,
+                )
+        except Exception:
+            pass
+
         if not self.cfg.journal_path or self.cfg.journal_path == os.devnull:
             return
         try:
             self._fp(self.cfg.journal_path).write(json.dumps({
                 "type": "markout", "fill_ts": f.ts, "side": f.side,
-                "h": horizon, "markout_bps": round(float(m_bps), 4)}) + "\n")
+                "h": horizon, "markout_bps": round(m_val, 4)}) + "\n")
         except Exception:
             pass
 
@@ -384,6 +478,10 @@ class MarketMaker:
             now = self.now()
             self.ledger.last_now = now
             self.ledger.current_now = now
+            # Synchronize live exchange WebSocket RTT and queue depth into engine latency state
+            self.engine.latency_state.ws_rtt_ms = getattr(self.ex, "rtt_ms", 10.0)
+            self.engine.latency_state.order_ack_ms = getattr(self.ex, "rtt_ms", 15.0)
+            self.engine.latency_state.queue_backlog = len(getattr(self.ex, "_pending", ()))
             if hasattr(self.ledger, "learner") and (now - getattr(self, "_last_decay_call", 0.0) >= 1.0):
                 self._last_decay_call = now
                 self.ledger.learner.tick_decay(now)
@@ -469,15 +567,22 @@ class MarketMaker:
             buy_blocked = (now < self._burst_blocked_until[BUY] or now < self._trend_blocked_until[BUY])
             sell_blocked = (now < self._burst_blocked_until[SELL] or now < self._trend_blocked_until[SELL])
 
-            l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
-            trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
+            tick_now = m.tick_for(mid) if hasattr(m, "tick_for") else m.tick
+            tick_bps_now = (tick_now / mid) * BPS if mid > ZERO else Decimal("0.5")
 
-            ret_trend = self.md.ret_bps(self.cfg.trend_window_s, now)
+            l = self.ledger.learner if (self.cfg.enable_online_learning and hasattr(self.ledger, 'learner')) else None
+            base_trend_pull = l.trend_pull_bps if l else self.cfg.trend_pull_bps
+            # Scale trend_pull by tick_bps so 1-2 tick moves on coarse-tick tokens (e.g. PUMP-USD) never block quoting
+            trend_pull = max(base_trend_pull, tick_bps_now * Decimal("3.5"))
+            trend_win = l.trend_window_s if (l and hasattr(l, 'trend_window_s')) else self.cfg.trend_window_s
+            trend_hold = l.trend_hold_s if (l and hasattr(l, 'trend_hold_s')) else self.cfg.trend_hold_s
+
+            ret_trend = self.md.ret_bps(trend_win, now)
             if ret_trend <= -trend_pull:
-                self._trend_blocked_until[BUY] = now + self.cfg.trend_hold_s
+                self._trend_blocked_until[BUY] = now + trend_hold
                 buy_blocked = True
             elif ret_trend >= trend_pull:
-                self._trend_blocked_until[SELL] = now + self.cfg.trend_hold_s
+                self._trend_blocked_until[SELL] = now + trend_hold
                 sell_blocked = True
 
             if self.cfg.enable_cross_exchange and self.md.cross.venues:
@@ -499,14 +604,24 @@ class MarketMaker:
                 tfi = self.md.trade_flow_imbalance(10.0, now)
                 self.ledger.learner.on_flow_correlation(self.md.obi, tfi, ret_5s)
 
-            if self.md.move_bps(self.cfg.vol_window_s, now) >= self.cfg.vol_pause_bps:
+            eff_vol_pause = max(self.cfg.vol_pause_bps, tick_bps_now * Decimal("8.0"))
+            if self.md.move_bps(self.cfg.vol_window_s, now) >= eff_vol_pause:
                 # Volatility spike: pause ADDING sides, never pause UNWIND sides
                 if pos_usd >= 0:
                     buy_blocked = True
                 if pos_usd <= 0:
                     sell_blocked = True
 
-            if getattr(self, "_loss_pause_until", 0.0) or getattr(self, "_rth_unwind_only", False) or in_et_windows(self.cfg.et_pause_windows, time.time()):
+            # Only apply ET_PAUSE_WINDOWS to US equity markets unless explicitly running a test on BTC-USD with ET_PAUSE_WINDOWS
+            sym_base = m.name.split("-")[0].upper() if m and m.name else ""
+            is_crypto_24_7 = sym_base in ("PUMP", "ETH", "SOL", "HYPE", "DOGE", "SUI", "XRP", "PEPE", "WIF", "BONK", "AVAX", "LINK", "ARB", "OP", "APT", "SEI", "TIA", "INJ", "NEAR", "TON")
+            et_paused = (not is_crypto_24_7) and in_et_windows(self.cfg.et_pause_windows, time.time())
+            if et_paused and now - self._last_pause_log.get("et_win", 0.0) > 30.0:
+                self._last_pause_log["et_win"] = now
+                log.warning("%s is inside ET_PAUSE_WINDOWS (%s, ET=%s) - pausing new adds (set ET_PAUSE_WINDOWS= to trade 24/7)",
+                            m.name, self.cfg.et_pause_windows, et_hhmmss(time.time()))
+
+            if getattr(self, "_loss_pause_until", 0.0) or getattr(self, "_rth_unwind_only", False) or et_paused:
                 # ET blackout (e.g. US open): stop ADDING, never block unwinds
                 if pos_usd >= 0:
                     buy_blocked = True
@@ -515,13 +630,17 @@ class MarketMaker:
 
             if self.cfg.oracle_guard and m.mark and mid and (self.now() - self.md.info_ts) <= max(15.0, 3 * self.cfg.market_refresh_s):
                 dev = (m.mark - mid) / mid * BPS          # >0: oracle above the book -> price likely to rise
-                if dev >= self.cfg.oracle_guard_bps and pos_usd <= 0:
-                    sell_blocked = True                    # don't SELL (add) below the oracle
-                elif dev <= -self.cfg.oracle_guard_bps and pos_usd >= 0:
-                    buy_blocked = True                     # don't BUY (add) above the oracle
-                if abs(dev) >= self.cfg.oracle_guard_bps and now - self._last_pause_log.get("oguard", 0.0) > 30.0:
-                    self._last_pause_log["oguard"] = now
-                    log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
+                eff_og_bps = max(self.cfg.oracle_guard_bps, tick_bps_now * Decimal("3.5"), self.md.spread_bps * Decimal("1.2"))
+                # When off-hours equity oracle is frozen (>15 bps persistent divergence while < max_oracle_dev_bps), don't block 100% of quotes
+                is_stale_offhours_oracle = (sym_base == "PUMP") or (sym_base in ("NVDA", "NBIS", "CRCL", "HOOD", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOG", "AMD", "PLTR", "COIN", "MSTR") and abs(dev) > Decimal("15.0"))
+                if not is_stale_offhours_oracle:
+                    if dev >= eff_og_bps and pos_usd <= 0:
+                        sell_blocked = True                    # don't SELL (add) below the oracle
+                    elif dev <= -eff_og_bps and pos_usd >= 0:
+                        buy_blocked = True                     # don't BUY (add) above the oracle
+                    if abs(dev) >= eff_og_bps and now - self._last_pause_log.get("oguard", 0.0) > 30.0:
+                        self._last_pause_log["oguard"] = now
+                        log.info("ORACLE_GUARD mark_dev=%+.2fbps -> blocking %s adds", float(dev), "SELL" if dev > 0 else "BUY")
 
             existing_slots = set(self.om.pair_slots.keys())
             targets = self.engine.generate_ladder_quotes(
@@ -537,8 +656,15 @@ class MarketMaker:
             await self.om.sync_quotes(targets, now, blocked_sides=blocked_sides)
 
     async def _heartbeat(self, now: float) -> None:
-        """Arm/refresh the exchange-side dead man's switch (scheduleCancel) for our market."""
+        """Send Lighter application-level WS keepalive ping and refresh Dead Man's Switch (`SignCancelAllOrders`)."""
         cfg = self.cfg
+        if now - getattr(self, "_last_ws_ping", 0.0) >= 25.0:
+            self._last_ws_ping = now
+            if hasattr(self.ex, "send_ping") and getattr(self.ex, "ws", None) is not None and hasattr(self.ex.ws, "transport"):
+                try:
+                    await self.ex.send_ping()
+                except Exception:
+                    pass
         if cfg.dry_run or not cfg.dms_enabled or not self.md.info:
             return
         interval = min(cfg.heartbeat_s, cfg.dms_ttl_s / 3.0)
@@ -622,7 +748,10 @@ class MarketMaker:
         QUOTE_OUTSIDE_RTH pause ran on a frozen snapshot. Refresh the volatile fields in place (tick/step untouched)."""
         if self.cfg.market_refresh_s <= 0 or not self.md.info:
             return
-        if now - getattr(self, "_last_mkt_refresh", -1e9) < self.cfg.market_refresh_s:
+        eff_refresh = max(5.0, float(self.cfg.market_refresh_s))
+        if now < getattr(self, "_mkt_refresh_backoff_until", 0.0):
+            return
+        if now - getattr(self, "_last_mkt_refresh", -1e9) < eff_refresh:
             return
         self._last_mkt_refresh = now
         try:
@@ -644,11 +773,68 @@ class MarketMaker:
             self._last_rth_flag = fresh.is_outside_rth
             self.md.info_ts = now
         except Exception as e:
+            if "429" in str(e):
+                self._mkt_refresh_backoff_until = now + 15.0
             if now - getattr(self, "_last_mkt_err", -1e9) > 60.0:
                 self._last_mkt_err = now
                 log.warning("market info refresh failed: %s", e)
 
+    def _on_reduce_only_rejected(self, side: Optional[str] = None) -> None:
+        log.warning("REDUCE_ONLY REJECTED: exchange has no position in this direction! Forcing position sync with exchange.")
+        if side == SELL and self.ledger.position > ZERO:
+            log.warning("Correcting local ledger long position %s -> 0 due to exchange REDUCE_ONLY rejection", fmt(self.ledger.position))
+            self.ledger.position = ZERO
+        elif side == BUY and self.ledger.position < ZERO:
+            log.warning("Correcting local ledger short position %s -> 0 due to exchange REDUCE_ONLY rejection", fmt(self.ledger.position))
+            self.ledger.position = ZERO
+        self._spawn_bg("reconcile_force", self._reconcile_positions, self.now(), force=True)
+
+    async def _reconcile_positions(self, now: float, force: bool = False) -> None:
+        if self.cfg.dry_run:
+            return
+        m = self.md.info
+        if not m:
+            return
+        try:
+            res = None
+            if self.ex.is_connected:
+                res = await self.ex.get("account", {"address": self.cfg.address, "accountIndex": self.cfg.account_index})
+                if not res:
+                    res = await self.ex.get("positions", {"address": self.cfg.address, "accountIndex": self.cfg.account_index})
+            if not res and not self.cfg.dry_run and hasattr(self.ex, "fetch_account"):
+                res = await self.ex.fetch_account()
+                if not res and hasattr(self.ex, "fetch_positions"):
+                    res = await self.ex.fetch_positions()
+            if res:
+                rows = extract_positions(res)
+                target_mid = self.md.mid or m.mark or Decimal("1")
+                found = False
+                for r in rows:
+                    if int(r.get("marketId", -1)) == m.market_id:
+                        found = True
+                        side = str(r.get("side", "FLAT")).upper()
+                        raw_sz = Decimal(str(r.get("size") or r.get("position") or "0"))
+                        if side in ("LONG", "BUY"):
+                            signed_pos = abs(raw_sz)
+                        elif side in ("SHORT", "SELL"):
+                            signed_pos = -abs(raw_sz)
+                        else:
+                            signed_pos = raw_sz
+                        old_pos = self.ledger.position
+                        if self.ledger.reconcile(signed_pos, now, target_mid, m.min_notional, force=force):
+                            log.info("POSITION RECONCILED WITH EXCHANGE: %s %s (was %s)", side, fmt(signed_pos), fmt(old_pos))
+                        break
+                if not found:
+                    old_pos = self.ledger.position
+                    if old_pos != ZERO:
+                        if self.ledger.reconcile(ZERO, now, target_mid, m.min_notional, force=force):
+                            log.info("POSITION RECONCILED WITH EXCHANGE: FLAT 0 (was %s)", fmt(old_pos))
+        except Exception as e:
+            log.debug("position reconciliation error: %s", e)
+
     async def _reconcile(self, now: float) -> None:
+        if self.cfg.dry_run:
+            return
         if now - self._last_reconcile < self.cfg.reconcile_s:
             return
         self._last_reconcile = now
@@ -662,6 +848,7 @@ class MarketMaker:
                 await self.om.reconcile(res["openOrders"], now)
         except Exception:
             pass
+        await self._reconcile_positions(now)
 
     def _status_log(self, now: float) -> None:
         if now - self._last_status < self.cfg.status_s:
@@ -718,13 +905,18 @@ class MarketMaker:
     async def run(self) -> None:
         if self.cfg.enable_online_learning and hasattr(self.ledger, "learner"):
             self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
-        log.info("Connecting to %s Arcus WS (%s)...", self.cfg.env_name, self.ex.ws_url)
+        log.info("Connecting to %s Robinhood Lighter Perp DEX (%s)...", self.cfg.env_name, self.ex.ws_url)
+        if not self.cfg.dry_run:
+            if self.cfg.account_index <= 0 and hasattr(self.ex, "resolve_account_index"):
+                await self.ex.resolve_account_index()
+            if hasattr(self.ex, "fetch_next_nonce"):
+                await self.ex.fetch_next_nonce()
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
         self.md.info_ts = self.now()
-        log.info("Market loaded: %s (ID %d) tick=%s step=%s min_notional=$%s",
-                 self.md.info.name, self.md.info.market_id, self.md.info.tick,
-                 self.md.info.step, self.md.info.min_notional)
+        log.info("Market loaded: %s (ID %d, symbol=%s) tick=%s step=%s min_notional=$%s chain_id=%d",
+                 self.md.info.name, self.md.info.market_id, getattr(self.md.info, "symbol", self.md.info.name),
+                 self.md.info.tick, self.md.info.step, self.md.info.min_notional, getattr(self.cfg, "chain_id", 466324))
 
         try:
             import websockets
@@ -755,15 +947,28 @@ class MarketMaker:
                     close_timeout=5,
                     compression=None
                 ) as ws:
+                    # Enable TCP_NODELAY for minimal wire latency
+                    try:
+                        sock = ws.transport.get_extra_info("socket") if getattr(ws, "transport", None) else None
+                        if sock is not None:
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception:
+                        pass
+
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
 
-                    await self.ex.subscribe("bbo", self.cfg.market)
-                    await self.ex.subscribe("l2Orderbook", self.cfg.market)
-                    await self.ex.subscribe("trades", self.cfg.market)
-                    await self.ex.subscribe("orders", self.cfg.address)
-                    await self.ex.subscribe("userFills", self.cfg.address)
-                    await self.ex.subscribe("positions", self.cfg.address)
+                    if hasattr(self.ex, "subscribe_lighter_feeds"):
+                        await self.ex.subscribe_lighter_feeds(self.md.info.market_id, self.cfg.account_index)
+                    else:
+                        await asyncio.gather(
+                            self.ex.subscribe("bbo", self.cfg.market),
+                            self.ex.subscribe("l2Orderbook", self.cfg.market),
+                            self.ex.subscribe("trades", self.cfg.market),
+                            self.ex.subscribe("orders", self.cfg.address),
+                            self.ex.subscribe("userFills", self.cfg.address),
+                            return_exceptions=True,
+                        )
 
                     reconnect_delay = 1.0
                     self._last_heartbeat = 0.0
@@ -781,13 +986,14 @@ class MarketMaker:
                         self._spawn_bg("mktinfo", self._refresh_market_info, now)
                         self._status_log(now)
 
+                        self._dirty_evt.clear()
                         await self.tick()
 
-                        try:
-                            await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
-                            self._dirty_evt.clear()
-                        except asyncio.TimeoutError:
-                            pass
+                        if not self._dirty_evt.is_set():
+                            try:
+                                await asyncio.wait_for(self._dirty_evt.wait(), timeout=self.cfg.loop_s)
+                            except asyncio.TimeoutError:
+                                pass
 
                     if self.stop_evt.is_set():
                         await self._graceful_cancel()  # must happen while the socket is still open
@@ -826,3 +1032,42 @@ class MarketMaker:
             except Exception:
                 pass
         self._close_files()
+
+
+def setup_logging(level_str: str) -> None:
+    lvl = getattr(logging, level_str.upper(), logging.INFO)
+    logging.basicConfig(
+        level=lvl,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+async def main() -> None:
+    cfg = Config.from_env()
+    setup_logging(cfg.log_level)
+
+    errors = cfg.validate()
+    if errors:
+        for err in errors:
+            log.error("Config error: %s", err)
+        sys.exit(1)
+
+    bot = MarketMaker(cfg)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, bot.stop_evt.set)
+        except NotImplementedError:
+            pass
+
+    await bot.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

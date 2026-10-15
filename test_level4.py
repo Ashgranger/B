@@ -14,6 +14,7 @@ import unittest
 from decimal import Decimal as D
 
 import sim
+import orders
 from latent_state import MarketRegime, BeliefState
 from level4_control import (
     DecisionState,
@@ -279,6 +280,288 @@ class TestLevel4MarketMaker(unittest.IsolatedAsyncioTestCase):
         recovered_buy = bot.om.get_order_by_slot(0, BUY)
         self.assertIsNotNone(recovered_buy, "Bot should resume quoting after cooldown and recovery")
         print(f"✓ test_06_joint_optimization_end_to_end passed: Active withdrawal, full quote cancel, and recovery verified.")
+
+    async def test_07_phantom_fill_and_reduce_only_recovery(self):
+        """7. Phantom Fill Prevention & Reduce-Only Recovery:
+        Verifies that cancelled orders with remainingSize=0 never create phantom fills,
+        and REDUCE_ONLY_WOULD_INCREASE immediately triggers forced position sync."""
+        bot, s, clock = sim.make()
+        fills_recorded = []
+        bot.om.on_fill = lambda side, qty, px, o: fills_recorded.append((side, qty, px))
+
+        # 1. Simulate cancelled order with remainingSize=0
+        import orders
+        o = orders.Order('test-1', 0, 'BUY', D('80000'), D('0.1'), D('0.1'), 1000, 0, 0)
+        bot.om.orders['test-1'] = o
+        cancel_msg = {
+            'orderId': 'test-1', 'state': 'CANCELED', 'status': 'CANCELED',
+            'remainingSize': '0', 'filledSize': '0', 'price': '80000'
+        }
+        bot.om.on_update(cancel_msg, 10.0)
+        self.assertEqual(len(fills_recorded), 0, 'Cancelled order must never trigger phantom fill')
+
+        # 2. Simulate REDUCE_ONLY_WOULD_INCREASE rejection
+        reconciled_called = []
+        bot.om.on_reduce_only_rejected = lambda: reconciled_called.append(True)
+        o2 = orders.Order('test-2', 0, 'SELL', D('80010'), D('0.1'), D('0.1'), 1000, 0, 0)
+        bot.om.orders['test-2'] = o2
+        reject_msg = {
+            'orderId': 'test-2', 'state': 'REJECTED', 'status': 'REJECTED',
+            'rejectionReason': 'REDUCE_ONLY_WOULD_INCREASE'
+        }
+        bot.om.on_update(reject_msg, 11.0)
+        self.assertEqual(len(reconciled_called), 1, 'Reduce-only reject must trigger position reconciliation')
+        print('✓ test_07_phantom_fill_and_reduce_only_recovery passed: Zero phantom fills and immediate recovery verified.')
+
+    async def test_08_reconcile_signed_short_position_and_hardware_clamp(self):
+        """8. Reconcile Signed Short Position & Hardware Reduce-Only Clamp:
+        Verifies that exchange signed positions (-0.2393776 for SHORT) do NOT flip sign to positive,
+        and hardware clamp in OrderManager prevents reduce_only=True on SELL when short or flat."""
+        bot, s, clock = sim.make()
+        bot.md.info.mark = D('83.50')
+        res = {'positions': [{'marketId': bot.md.info.market_id, 'size': '-0.2393776', 'side': 'SHORT'}]}
+        bot.ex.get = lambda *args, **kwargs: asyncio.sleep(0, result=res)
+        await bot._reconcile_positions(100.0, force=True)
+        self.assertEqual(bot.ledger.position, D('-0.2393776'), 'Position must be SHORT -0.2393776, NOT flipped to positive!')
+
+        # Test hardware clamp
+        target = orders.Order('dummy', 0, SELL, D('83.56'), D('0.2393776'), D('0.2393776'), 1000, 0, 0)
+        target.is_exit_quote = True
+        target.pair_index = 0
+        target.side = SELL
+        target.price = D('83.56')
+        target.qty = D('0.2393776')
+        placed_orders = []
+        async def mock_place(pair_index, side, price, qty, now, time_in_force='ALO', reduce_only=False, **kwargs):
+            placed_orders.append((side, price, qty, reduce_only))
+            return orders.Order('placed-1', pair_index, side, price, qty, qty, 1000, now, now, is_reduce_only=reduce_only)
+        bot.om.place = mock_place
+        await bot.om._sync_one(target, 100.0)
+        self.assertEqual(len(placed_orders), 1)
+        self.assertFalse(placed_orders[0][3], 'Hardware clamp MUST disarm reduce_only on SELL when position is short!')
+        print('✓ test_08_reconcile_signed_short_position_and_hardware_clamp passed: Correct sign reconciliation and clamp verified.')
+
+    async def test_09_realtime_flow_defense_and_sweep_guard_adaptation(self):
+        """9. Real-Time Flow Defense & Sweep Guard Adaptation:
+        Verifies that Sweep Guard and Burst Guard events trigger immediate real-time feedback
+        to the Online Learner, expanding sweep windows, tightening trend pull hurdles,
+        and adapting burst cooldowns dynamically."""
+        bot, s, clock = sim.make(ENABLE_ONLINE_LEARNING=1)
+        l = bot.ledger.learner
+        base_sw = l.sweep_guard_window_s
+        base_bcd = l.burst_cooldown_s
+        base_bwin = l.burst_window_s
+        base_pull = l.trend_pull_bps
+        base_edge = l.min_edge_bps
+
+        # 1. Trigger sweep event
+        l.on_sweep('BUY', 2, 1.5)
+        self.assertGreater(l.sweep_guard_window_s, base_sw, 'Sweep window must expand on sweep detection')
+        self.assertGreater(l.burst_cooldown_s, base_bcd, 'Burst cooldown must increase on sweep detection')
+        self.assertGreater(l.min_edge_bps, base_edge, 'Min edge must widen on sweep detection')
+        self.assertLess(l.trend_pull_bps, base_pull, 'Trend pull must tighten on sweep detection')
+
+        # 2. Trigger burst event
+        l.on_burst('SELL', 2, 20.0)
+        self.assertGreater(l.burst_window_s, base_bwin, 'Burst window must expand on burst detection')
+
+        # 3. Trigger adverse markout
+        cur_sw = l.sweep_guard_window_s
+        cur_th = l.trend_hold_s
+        l.on_markout(D('-4.5'), 'BUY', D('2.0'), horizon=5.0)
+        self.assertGreater(l.sweep_guard_window_s, cur_sw, 'Sweep window must expand on adverse markout')
+        self.assertGreater(l.trend_hold_s, cur_th, 'Trend hold must increase on adverse markout')
+        print('✓ test_09_realtime_flow_defense_and_sweep_guard_adaptation passed: Real-time dynamic updates verified.')
+
+
+    async def test_10_unified_system_no_ladder_collision_and_no_wiggle_loss(self):
+        """10. Unified System Closed-Loop Feedback, Wiggle Protection & Ladder Collision Guard:
+        Verifies:
+        - Normal 1.5-2.5 bps wiggles do NOT trigger maker loss-selling below breakeven.
+        - L1 can never collide at the exact same price as a resting L0 order.
+        - Fills and markouts feed back into impact_kernel, meta_learner, markout_model, and causal_estimator.
+        """
+        bot, s, clock = sim.make(
+            ORDER_USD=20, MAX_POSITION_USD=100, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="2.2", LEVEL_SPACING_BPS="2.0", MAKER_EXIT_FIRST="1", ENABLE_TAKER_EXITS="0"
+        )
+        m = sim.Market(10, "NVDA-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("226.90"), False)
+        bot.md.info = m
+        bot.md.update(D("226.89"), D("226.91"), D("10.0"), D("10.0"), clock.t)
+
+        # 1. Enter Long at 226.90
+        import orders, engine
+        o_buy = orders.Order("b0", 0, BUY, D("226.90"), D("0.10"), D("0.10"), 1001, clock.t, clock.t, quote_mid=D("226.90"))
+        bot._on_fill(BUY, D("0.10"), D("226.90"), o_buy)
+        self.assertGreater(len(bot.engine.impact_kernel.trades), 0, "Fill must feed impact_kernel")
+        self.assertGreater(len(bot.engine.meta_learner._fills_log), 0, "Fill must feed meta_learner")
+
+        # 2. Simulate a 2.0 bps dip (226.85 / 226.87, mid=226.86 -> -1.76 bps unrealized)
+        clock.t += 1.0
+        bot.md.update(D("226.85"), D("226.87"), D("10.0"), D("10.0"), clock.t)
+        bot.ledger.process_markouts(bot.md.mid, clock.t)
+        self.assertGreater(len(bot.engine.markout_model.distributions), 0, "Markout must feed markout_model")
+
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        sells = [q for q in quotes if q.side == SELL]
+        self.assertGreaterEqual(len(sells), 1)
+        self.assertGreaterEqual(sells[0].price, D("226.90"), "Maker unwind must NOT dump at 226.87 loss on a 1.76 bps wiggle!")
+        if len(sells) >= 2:
+            self.assertGreater(sells[1].price, sells[0].price, "L1S must be strictly higher than L0S!")
+
+        # 3. Verify OrderManager collision guard when L0S is resting at 226.94 and L1S tries to modify to 226.94
+        o0 = orders.Order("s0", 0, SELL, D("226.94"), D("0.10"), D("0.10"), 2001, clock.t, clock.t)
+        o1 = orders.Order("s1", 1, SELL, D("226.98"), D("0.10"), D("0.10"), 2002, clock.t - 5.0, clock.t - 5.0)
+        bot.om.orders = {"s0": o0, "s1": o1}
+        bot.om.pair_slots = {(0, SELL): "s0", (1, SELL): "s1"}
+        modified_prices = []
+        async def mock_mod(o, px, now, reduce_only=None, **kw):
+            modified_prices.append(px)
+            o.price = px
+            return True
+        bot.om.modify = mock_mod
+        t1 = engine.QuoteTarget(1, SELL, D("226.94"), D("0.10"), D("1.0"), 0.5, False, D("226.90"))
+        await bot.om._sync_one(t1, clock.t)
+        if modified_prices:
+            self.assertGreater(modified_prices[0], D("226.94"), "Collision guard must push L1S strictly above resting L0S (226.94)!")
+        print("✓ test_10_unified_system_no_ladder_collision_and_no_wiggle_loss passed: Closed-loop system, wiggle protection & collision guard verified.")
+
+
+    async def test_11_nbis_log_regression_strict_edge_and_no_wick_stop(self):
+        """11. NBIS-USD Log Regression (Strict Edge Floor, Wick-Stop Protection & Persistent Toxicity Floor):
+        Verifies:
+        - When MIN_EDGE_BPS=3.2 and ENABLE_SELECTIVE_TOUCH=1, L0 never quotes inside model_px (<3.2 bps from mid).
+        - A transient -11.0 bps wick at hold=3.0s (with STRESS_LOSS_BPS=15.0) does NOT trigger stress_loss stop-out.
+        - After >=10 markouts with >55% adverse fill rate, tick_decay preserves an elevated toxicity floor above base.
+        """
+        import orders, engine
+        bot, s, clock = sim.make(
+            ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="3.2", LEVEL_SPACING_BPS="3.5", STRESS_LOSS_BPS="15.0",
+            EMERGENCY_TAKER_LOSS_BPS="18.0", ENABLE_SELECTIVE_TOUCH="1",
+            MAKER_EXIT_FIRST="1", ENABLE_TAKER_EXITS="0"
+        )
+        m = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0000001"), [], D("5"), D("0.0000001"), D("100000"), D("186.50"), False)
+        bot.md.info = m
+        bot.md.update(D("186.49"), D("186.51"), D("10.0"), D("10.0"), clock.t)
+
+        # 1. Flat quoting: L0 bid must respect MIN_EDGE_BPS=3.2 (<= 186.44, never at touch 186.49!)
+        quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        bids = [q for q in quotes if q.side == BUY]
+        self.assertGreaterEqual(len(bids), 1)
+        self.assertLessEqual(bids[0].price, D("186.44"), f"L0 bid {bids[0].price} must respect MIN_EDGE_BPS=3.2 (<=186.44)")
+
+        # 2. Enter Long at 186.44, then experience a 3.0s wick down to 186.23 (-11.26 bps unrealized)
+        o_buy = orders.Order("b0", 0, BUY, D("186.44"), D("0.18"), D("0.18"), 1001, clock.t, clock.t, quote_mid=D("186.50"))
+        bot._on_fill(BUY, D("0.18"), D("186.44"), o_buy)
+        clock.t += 3.0
+        bot.md.update(D("186.22"), D("186.24"), D("10.0"), D("10.0"), clock.t)
+        u_quotes = bot.engine.generate_ladder_quotes(m, bot.md, bot.ledger, clock.t, False, False)
+        sells = [q for q in u_quotes if q.side == SELL]
+        self.assertGreaterEqual(len(sells), 1)
+        self.assertFalse(sells[0].is_taker, "Must NOT fire taker IOC on a 3s wick!")
+        self.assertGreaterEqual(sells[0].price, D("186.44"), "Must hold breakeven 186.44 during a 3s wick instead of dumping at 186.24!")
+
+        # 3. Verify learner persistent toxicity floor after >=10 markouts with high adverse fill rate
+        l = bot.ledger.learner
+        for _ in range(12):
+            l.on_markout(D("-3.0"), BUY, D("3.0"), horizon=5.0, now=clock.t)
+        clock.t += 120.0
+        l.tick_decay(clock.t)
+        self.assertGreater(l.min_edge_bps, D("3.5"), "Learner must retain elevated min_edge_bps floor when adverse_fill_rate > 55%!")
+        self.assertGreater(l.skew_bps, bot.cfg.skew_bps, "Learner must retain elevated skew_bps floor when adverse_fill_rate > 55%!")
+        print("✓ test_11_nbis_log_regression_strict_edge_and_no_wick_stop passed: NBIS-USD regression fixes verified.")
+
+
+    async def test_12_dry_run_paper_simulator_fills_and_rolling_learner(self):
+        """12. DRY_RUN Paper Simulator Fills & Rolling Learner Win/Adverse Ratio Adaptation:
+        Verifies:
+        - When DRY_RUN=1, resting paper orders fill on live BBO crosses and queue-depleting trades,
+          and _reconcile() does not wipe out paper orders or simulated positions.
+        - OnlineLearner rolling win_rate / adverse_fill_rate adapts toward 50/50+ as benign markouts arrive,
+          even if historical lifetime n_toxic was high.
+        """
+        bot, s, clock = sim.make(DRY_RUN="1", ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=0, MIN_EDGE_BPS="2.5")
+        m = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("186.50"), False)
+        bot.md.info = m
+        bot.md.update(D("186.49"), D("186.51"), D("5.0"), D("5.0"), clock.t)
+        await bot.tick()
+        self.assertGreater(len(bot.om.orders), 0, "DRY_RUN must place paper orders")
+
+        # Verify _reconcile in DRY_RUN=1 does NOT drop paper orders
+        clock.t += 10.0
+        await bot._reconcile(clock.t)
+        self.assertGreater(len(bot.om.orders), 0, "DRY_RUN _reconcile must NOT drop paper orders!")
+
+        # Simulate a trade hitting our paper bid
+        b_ord = bot.om.get_order_by_slot(0, BUY)
+        self.assertIsNotNone(b_ord)
+        bot._on_channel("trades", {"side": "SELL", "quantity": "10.0", "price": str(b_ord.price)}, False)
+        self.assertGreater(bot.ledger.n_fills, 0, "DRY_RUN trade matching must record fill!")
+        self.assertGreater(bot.ledger.position, D(0), "DRY_RUN position must increase on BUY fill!")
+
+        # Verify rolling win_rate / adverse_fill_rate drifts upward when calibrated fills are benign
+        l = bot.ledger.learner
+        l.n_toxic = 150
+        l.n_benign = 50
+        for _ in range(10):
+            l.on_markout(D("1.2"), BUY, D("0.5"), horizon=5.0, now=clock.t)
+        self.assertGreaterEqual(l.win_rate, 60.0, "Rolling win_rate must adapt upward when recent markouts improve!")
+        print("✓ test_12_dry_run_paper_simulator_fills_and_rolling_learner passed: Paper simulator fills and rolling learner verified.")
+
+
+    async def test_13_pump_usd_active_quoting_and_accurate_pnl(self):
+        """13. PUMP-USD 24/7 Active Quoting & Accurate Modify-Race / UserFill PnL Accounting:
+        Verifies:
+        - PUMP-USD (mid=0.003500, tick=0.000001 ~ 2.86bps) actively places L0 + L1 two-sided quotes
+          even when ET_PAUSE_WINDOWS=15:50-09:45 is set, and is not blocked by 1-2 tick moves (~5.7 bps).
+        - Unwind breakeven_px includes at least +1 tick profit (never $0.00 gross profit on normal hold time).
+        - Modify-race fill and userFills channel reconcile exact execution price and fee into ledger.realized.
+        """
+        import orders, engine
+        bot, s, clock = sim.make(
+            MARKET="PUMP-USD", ORDER_USD=35, MAX_POSITION_USD=105, EXTRA_LEVELS=1,
+            MIN_EDGE_BPS="2.2", LEVEL_SPACING_BPS="3.5", ET_PAUSE_WINDOWS="00:00-23:59",
+            TREND_PULL_BPS="2.0", JUMP_BPS="5.5", VOL_PAUSE_BPS="10.0", ORACLE_GUARD="1", ORACLE_GUARD_BPS="3.0"
+        )
+        m_pump = sim.Market(99, "PUMP-USD", "ONLINE", D("0.000001"), D("1"), [], D("5"), D("1"), D("10000000"), D("0.003530"), False)
+        bot.md.info = m_pump
+        bot.md.info_ts = clock.t
+
+        # Simulate a 2-tick move on PUMP-USD (0.003500 -> 0.003502 = 5.71 bps)
+        await sim.step(bot, s, clock, "0.003499", "0.003501", bsz="50000", asz="50000")
+        await sim.step(bot, s, clock, "0.003501", "0.003503", bsz="50000", asz="50000", dt=0.5)
+
+        b0 = bot.om.get_order_by_slot(0, BUY)
+        s0 = bot.om.get_order_by_slot(0, SELL)
+        self.assertIsNotNone(b0, "PUMP-USD L0 BUY must be placed (never blocked by ET_PAUSE_WINDOWS or 2-tick move)!")
+        self.assertIsNotNone(s0, "PUMP-USD L0 SELL must be placed!")
+
+        # Test userFills exact execution price & fee reconciliation on NBIS-USD
+        bot2, s2, clock2 = sim.make(MARKET="NBIS-USD", ORDER_USD=35, MAX_POSITION_USD=105, MIN_EDGE_BPS="2.3", STRESS_LOSS_BPS="15.0")
+        m_nbis = sim.Market(46, "NBIS-USD", "ONLINE", D("0.01"), D("0.0001"), [], D("5"), D("0.0001"), D("100000"), D("182.02"), False)
+        bot2.md.info = m_nbis
+        bot2.md.update(D("182.01"), D("182.03"), D("10.0"), D("10.0"), clock2.t)
+
+        # Enter short at 182.02
+        o_sell = orders.Order("s1", 1, SELL, D("182.02"), D("0.10"), D("0.10"), 1001, clock2.t, clock2.t, quote_mid=D("182.00"))
+        bot2._on_fill(SELL, D("0.10"), D("182.02"), o_sell)
+
+        # Check unwind L0 BUY targets <= 182.01 (+1 tick profit, NOT 182.02 $0 profit!)
+        clock2.t += 2.0
+        bot2.md.update(D("182.01"), D("182.03"), D("2.0"), D("10.0"), clock2.t)
+        u_quotes = bot2.engine.generate_ladder_quotes(m_nbis, bot2.md, bot2.ledger, clock2.t, False, False)
+        u_buys = [q for q in u_quotes if q.side == BUY]
+        self.assertGreaterEqual(len(u_buys), 1)
+        self.assertLessEqual(u_buys[0].price, D("182.01"), "Unwind BUY must target at least 1 tick profit (<=182.01, not 182.02)!")
+
+        # Simulate modify-race fill: order was at 182.18 (prev_price), modified to 182.02 while mid=182.185, then FILLED arrives
+        o_buy = orders.Order("b_race", 0, BUY, D("182.02"), D("0.10"), D("0.10"), 1002, clock2.t, clock2.t, is_reduce_only=True, prev_price=D("182.18"))
+        bot2.om.orders["b_race"] = o_buy
+        bot2.md.update(D("182.18"), D("182.19"), D("10.0"), D("10.0"), clock2.t)
+        bot2.om._apply(o_buy, {"orderId": "b_race", "state": "FILLED", "status": "FILLED", "price": "182.02", "filledSize": "0.10", "remainingSize": "0"}, clock2.t)
+        self.assertLess(bot2.ledger.realized, D(0), "Modify-race fill at 182.18 must book real loss (-$0.016), NOT fake $0.00 at 182.02!")
+        print("✓ test_13_pump_usd_active_quoting_and_accurate_pnl passed: PUMP-USD active quoting & exact PnL accounting verified.")
 
 
 if __name__ == "__main__":

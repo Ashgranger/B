@@ -13,7 +13,7 @@ from typing import Callable, Optional, Dict, Tuple, List
 from exchange import Exchange
 from market import Market
 from signer import Signer
-from utils import BUY, SELL, fmt, bps_diff, q_down, q_up
+from utils import BUY, SELL, fmt, bps_diff, q_down, q_up, ZERO
 
 log = logging.getLogger("orders")
 GTT_DAYS = 40
@@ -37,6 +37,9 @@ class Order:
     ev_bps: Decimal = Decimal(0)
     quote_mid: Optional[Decimal] = None
     est_px: Optional[Decimal] = None
+    queue_ahead: Decimal = Decimal(0)
+    cum_filled: Decimal = Decimal(0)
+    prev_price: Optional[Decimal] = None
 
 
 class OrderManager:
@@ -45,6 +48,8 @@ class OrderManager:
         self.cfg, self.ex, self.signer = cfg, ex, signer
         self.get_market = get_market
         self.on_fill = on_fill
+        self.ledger = None
+        self.md = None
         
         self.orders: dict[str, Order] = {}
         self._last_taker: dict = {}
@@ -58,6 +63,7 @@ class OrderManager:
         self._consec_errors = 0
         self.last_place_ts = 0.0
         self.maybe_orders = True
+        self.on_reduce_only_rejected = None
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
 
     def side_orders(self, side: str) -> list[Order]:
@@ -107,10 +113,23 @@ class OrderManager:
             self.paused_until = max(self.paused_until, now + 10.0)
             self._actions.clear()
         elif code == 21104:
-            log.warning("INVALID NONCE (code 21104) - resynchronizing nonce generator")
+            log.warning("INVALID NONCE (code 21104) - resynchronizing nonce generator from /api/v1/nextNonce")
             if hasattr(self.signer, "next_ts"):
                 self.signer._last_ts = max(time.time_ns(), getattr(self.signer, "_last_ts", 0) + 50_000_000)
+            if hasattr(self.ex, "fetch_next_nonce"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.ex.fetch_next_nonce())
+                except RuntimeError:
+                    pass
             self.paused_until = max(self.paused_until, now + 1.5)
+        elif code == 21732 or (isinstance(err, dict) and "REDUCE_ONLY" in str(err.get("message", "")).upper()):
+            log.warning("REDUCE_ONLY REJECTED (code %s) - triggering position reconciliation", code)
+            if hasattr(self, "on_reduce_only_rejected") and callable(self.on_reduce_only_rejected):
+                try:
+                    self.on_reduce_only_rejected()
+                except Exception:
+                    pass
         if self._consec_errors >= 8:
             log.error("too many consecutive errors - pausing 30s")
             self.paused_until = now + 30
@@ -133,6 +152,12 @@ class OrderManager:
             px = q_up(px, tick) if side == BUY else q_down(px, tick)
         else:
             px = q_down(px, tick) if side == BUY else q_up(px, tick)
+            md = getattr(self, "md", None)
+            if md is not None and md.bid and md.ask and md.bid < md.ask:
+                if side == BUY and px >= md.ask:
+                    px = q_down(md.ask - tick, tick)
+                elif side == SELL and px <= md.bid:
+                    px = q_up(md.bid + tick, tick)
         qty = q_down(qty, m.step)
         if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
             return None
@@ -150,10 +175,18 @@ class OrderManager:
                 self._backoff(side, now)
             return None
         self._consec_errors = 0
+        self._reject_n[side] = 0
         self.n_place += 1
         oid = str(res["orderId"])
+        q_ahead = ZERO
+        if self.cfg.dry_run and not is_taker and self.md is not None and hasattr(self.md, "queue_ahead"):
+            try:
+                q_ahead = max(ZERO, self.md.queue_ahead(side, px) * Decimal("0.25"))
+            except Exception:
+                q_ahead = ZERO
         o = Order(oid, pair_index, side, px, qty, qty, good_til, now, now,
-                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px)
+                  is_taker=is_taker, is_reduce_only=reduce_only, quote_mid=quote_mid, est_px=est_px,
+                  queue_ahead=q_ahead)
         self.orders[oid] = o
         if not is_taker:
             self.pair_slots[(pair_index, side)] = oid
@@ -161,6 +194,13 @@ class OrderManager:
         early = self._unmatched.pop(oid, None)
         if early:
             self._apply(o, early[1], now)
+        if self.cfg.dry_run and is_taker:
+            fill_px = est_px or ((self.md.ask if side == BUY else self.md.bid) if self.md else None) or px
+            self._apply(o, {
+                "orderId": oid, "state": "FILLED", "status": "FILLED",
+                "price": str(px), "avgFillPrice": str(fill_px),
+                "filledSize": str(qty), "remainingSize": "0"
+            }, now)
         return o
 
     async def modify(self, o: Order, px: Decimal, now: float, urgent: bool = False,
@@ -172,7 +212,15 @@ class OrderManager:
         m = self.get_market()
         tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
         px = q_down(px, tick) if o.side == BUY else q_up(px, tick)
+        md = getattr(self, "md", None)
+        if md is not None and md.bid and md.ask and md.bid < md.ask:
+            if o.side == BUY and px >= md.ask:
+                px = q_down(md.ask - tick, tick)
+            elif o.side == SELL and px <= md.bid:
+                px = q_up(md.bid + tick, tick)
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
+        if px == o.price and r_only == o.is_reduce_only:
+            return True
         req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
         resp = await self.ex.write(req)
         if not self._ok(resp):
@@ -186,6 +234,13 @@ class OrderManager:
         self._consec_errors = 0
         self.n_modify += 1
         log.info("MODIFY L%d %s %s -> %s (reduce_only=%s)", o.pair_index, o.side, fmt(o.price), fmt(px), r_only)
+        if self.cfg.dry_run and px != o.price and self.md is not None and hasattr(self.md, "queue_ahead"):
+            try:
+                o.queue_ahead = max(ZERO, self.md.queue_ahead(o.side, px) * Decimal("0.25"))
+            except Exception:
+                o.queue_ahead = ZERO
+        if px != o.price:
+            o.prev_price = o.price
         o.price, o.last_action, o.is_reduce_only = px, now, r_only
         return True
 
@@ -265,18 +320,20 @@ class OrderManager:
 
     async def sync_quotes(self, targets: list, now: float, blocked_sides: Optional[set] = None) -> None:
         active_slots = set()
-        groups: dict = {}
+        side_groups: dict = {}
         for t in targets:
             slot = (t.pair_index, t.side)
-            groups.setdefault(slot, []).append(t)
+            side_groups.setdefault(t.side, []).append(t)
             if not getattr(t, "is_taker", False):
                 active_slots.add(slot)
 
-        async def run_group(ts: list) -> None:
-            for t in ts:  # same-slot targets stay strictly sequential
+        async def run_side(ts: list) -> None:
+            # Process L0 -> L1 -> L2 -> L3 in strict order per side so deeper levels never collide with resting closer levels
+            ts_sorted = sorted(ts, key=lambda x: (0 if getattr(x, "is_taker", False) else 1, x.pair_index))
+            for t in ts_sorted:
                 await self._sync_one(t, now)
 
-        coros = [run_group(ts) for ts in groups.values()]
+        coros = [run_side(ts) for ts in side_groups.values()]
         for slot, oid in list(self.pair_slots.items()):
             if slot not in active_slots:
                 o = self.orders.get(oid)
@@ -296,13 +353,42 @@ class OrderManager:
             if existing:
                 await self.cancel(existing, now)
                 self.pair_slots.pop(slot, None)
+            taker_r_only = True
+            ledger = getattr(self, "ledger", None)
+            if ledger is not None:
+                if (t.side == SELL and ledger.position <= ZERO) or (t.side == BUY and ledger.position >= ZERO):
+                    taker_r_only = False
+            self.reject_until[t.side] = max(self.reject_until[t.side], now + 0.50)
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                             time_in_force="IOC", reduce_only=True,
+                             time_in_force="IOC", reduce_only=taker_r_only,
                              quote_mid=getattr(t, "quote_mid", None),
                              est_px=getattr(t, "est_px", None))
             return
 
+        m = self.get_market()
+        tick = m.tick_for(t.price) if hasattr(m, "tick_for") else m.tick
+        target_px = t.price
+        # LADDER COLLISION GUARD: Ensure level k > 0 is strictly deeper than all resting levels < k on the same side
+        if t.pair_index > 0:
+            for o in self.orders.values():
+                if o.side == t.side and not o.is_taker and o.cancelling_since is None and o.pair_index < t.pair_index:
+                    if t.side == BUY and target_px >= o.price:
+                        target_px = q_down(o.price - tick, tick)
+                    elif t.side == SELL and target_px <= o.price:
+                        target_px = q_up(o.price + tick, tick)
+            t.price = target_px
+
         is_exit = bool(getattr(t, "is_exit_quote", False))
+        # HARDWARE CLAMP: reduce_only is ONLY valid if we hold an opposing position!
+        # A SELL can ONLY reduce a LONG position (pos > 0).
+        # A BUY can ONLY reduce a SHORT position (pos < 0).
+        ledger = getattr(self, "ledger", None)
+        if ledger is not None:
+            if t.side == SELL and ledger.position <= ZERO:
+                is_exit = False
+            elif t.side == BUY and ledger.position >= ZERO:
+                is_exit = False
+
         if existing is None:
             if now >= self.reject_until[t.side]:
                 o_new = await self.place(t.pair_index, t.side, t.price, t.qty, now,
@@ -312,16 +398,13 @@ class OrderManager:
                     o_new.ev_bps = getattr(t, "expected_value_bps", Decimal(0))
             return
 
-        m = self.get_market()
-        is_exit = bool(getattr(t, "is_exit_quote", False))
-
         # Check if unwind quantity mismatch (accumulated further fills: must resize!)
         qty_mismatch = abs(t.qty - existing.remaining) >= (m.step * Decimal("0.5"))
         if is_exit and qty_mismatch:
             await self.cancel(existing, now)
             self.pair_slots.pop(slot, None)
             await self.place(t.pair_index, t.side, t.price, t.qty, now,
-                             time_in_force="ALO", reduce_only=True,
+                             time_in_force="ALO", reduce_only=is_exit,
                              quote_mid=getattr(t, "quote_mid", None))
             return
 
@@ -343,7 +426,7 @@ class OrderManager:
         min_requote_delay = getattr(self.cfg, "touch_min_requote_s", self.cfg.min_requote_s) if existing.pair_index == 0 else self.cfg.min_requote_s
 
         # Don't modify on sub-tick or 1-tick jiggles unless drift exceeds threshold or min delay passed
-        if is_retreating and (drift >= eff_retreat):
+        if is_retreating and (drift >= eff_retreat) and (is_exit or time_since_last >= 0.25 or drift >= eff_retreat * Decimal("2.5")):
             should_modify = True
             urgent = True
         elif is_advancing and (drift >= eff_requote) and (time_since_last >= min_requote_delay):
@@ -370,6 +453,21 @@ class OrderManager:
         oid = str(c["orderId"])
         o = self.orders.get(oid)
         if o is None:
+            # Also check Lighter clientOrderIndex / venueOrderIndex mappings
+            alt_c = c.get("clientOrderIndex") or c.get("client_order_index")
+            alt_v = c.get("venueOrderIndex") or c.get("order_index")
+            if alt_c is not None and str(alt_c) in self.orders:
+                o = self.orders[str(alt_c)]
+            elif alt_v is not None and str(alt_v) in self.orders:
+                o = self.orders[str(alt_v)]
+            elif hasattr(self.signer, "venue_to_client_id") and oid in self.signer.venue_to_client_id:
+                mapped = self.signer.venue_to_client_id[oid]
+                o = self.orders.get(mapped)
+        if o is not None:
+            v_idx = c.get("venueOrderIndex") or c.get("order_index")
+            if v_idx is not None and hasattr(self.signer, "register_order_mapping"):
+                self.signer.register_order_mapping(o.order_id, v_idx)
+        if o is None:
             self._unmatched[oid] = (now, c)
             if len(self._unmatched) > 200:
                 self._unmatched = {k: v for k, v in self._unmatched.items() if v[0] > now - 30}
@@ -383,15 +481,25 @@ class OrderManager:
         status = str(c.get("status") or "").upper()
         filled = (state == "FILLED" or status == "FILLED")
         px = o.price
+        has_exec_px = False
         try:
             if c.get("price"):
                 px = Decimal(str(c["price"]))
-            # takers: record the real execution price when the exchange reports it, not our limit
-            for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice"):
+            for k in ("avgPrice", "averagePrice", "avgFillPrice", "lastFillPrice", "fillPrice", "matchedPrice", "execPrice"):
                 v = c.get(k)
                 if v and Decimal(str(v)) > 0:
                     px = Decimal(str(v))
+                    has_exec_px = True
                     break
+            # Guard against modify-race where an order filled at prev_price right as a retreating modify updated o.price
+            if (not has_exec_px) and (not o.is_taker) and getattr(o, "prev_price", None) is not None and (now - o.last_action < 8.0):
+                if self.md is not None and self.md.bid and self.md.ask:
+                    m = self.get_market()
+                    tick = m.tick_for(px) if hasattr(m, "tick_for") else m.tick
+                    if o.side == BUY and px < self.md.bid - Decimal("2") * tick and o.prev_price >= self.md.bid - Decimal("2") * tick:
+                        px = o.prev_price
+                    elif o.side == SELL and px > self.md.ask + Decimal("2") * tick and o.prev_price <= self.md.ask + Decimal("2") * tick:
+                        px = o.prev_price
         except Exception:
             pass
         if o.is_taker and (filled or state == "PARTIALLY_FILLED"):
@@ -403,19 +511,45 @@ class OrderManager:
             if not real and o.est_px and getattr(self.cfg, "taker_fill_price_mode", "est") == "est":
                 px = o.est_px   # exchange sent no execution price: book the book-walk estimate, NOT our far-through limit
         fill_qty = Decimal(0)
-        rem = c.get("remainingSize")
-        if rem is not None:
+        is_partially_filled = (state == "PARTIALLY_FILLED" or status == "PARTIALLY_FILLED")
+
+        # 1. Prefer cumulative filled size if reported by exchange (Arcus sends "filledSize")
+        cum_filled_raw = c.get("filledSize") or c.get("cumFilled") or c.get("executedQty")
+        if cum_filled_raw is not None:
             try:
-                new_rem = Decimal(str(rem))
-                if new_rem < o.remaining:
-                    fill_qty = o.remaining - new_rem
-                o.remaining = new_rem
+                cum_filled = Decimal(str(cum_filled_raw))
+                prev_filled = getattr(o, "cum_filled", Decimal(0))
+                if cum_filled > prev_filled:
+                    fill_qty = cum_filled - prev_filled
+                    o.cum_filled = cum_filled
+                    o.remaining = max(Decimal(0), o.qty - cum_filled)
+                else:
+                    fill_qty = Decimal(0)
             except Exception:
-                rem = None
-        if filled and rem is None:
-            fill_qty, o.remaining = o.remaining, Decimal(0)
+                fill_qty = Decimal(0)
+        elif filled or is_partially_filled:
+            # Only compute delta from remainingSize if state explicitly confirms an execution!
+            rem = c.get("remainingSize")
+            if rem is not None:
+                try:
+                    new_rem = Decimal(str(rem))
+                    if new_rem < o.remaining:
+                        fill_qty = o.remaining - new_rem
+                    o.remaining = new_rem
+                except Exception:
+                    rem = None
+            if filled and (rem is None or fill_qty == Decimal(0)):
+                fill_qty, o.remaining = o.remaining, Decimal(0)
+
+        # 2. Never book fills if order was canceled or rejected without execution!
+        if (state in ("CANCELED", "REJECTED", "EXPIRED") or status in ("CANCELED", "REJECTED", "EXPIRED")) and not filled and not is_partially_filled:
+            fill_qty = Decimal(0)
+
         if fill_qty > 0:
             o.filled_any = True
+            if not hasattr(self, "_recent_filled_orders"):
+                self._recent_filled_orders = {}
+            self._recent_filled_orders[o.order_id] = (now, o.side, fill_qty, px, getattr(o, "is_reduce_only", False))
             self.on_fill(o.side, fill_qty, px, o)
         if state == "OPEN" or status == "OPEN":
             self._reject_n[o.side] = 0
@@ -428,9 +562,27 @@ class OrderManager:
             self._remove_order(o.order_id)
         elif state in ("CANCELED", "REJECTED") or status in ("CANCELED", "MARGIN_CANCELED", "REJECTED"):
             reason = c.get("rejectionReason") or c.get("cancelReason") or ""
-            if (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
+            if "REDUCE_ONLY" in str(reason).upper():
+                log.warning("ORDER L%d %s REJECTED (%s): exchange position mismatch! Triggering position reconciliation.",
+                            o.pair_index, o.side, reason)
+                if hasattr(self, "on_reduce_only_rejected") and callable(self.on_reduce_only_rejected):
+                    try:
+                        self.on_reduce_only_rejected(o.side)
+                    except TypeError:
+                        try:
+                            self.on_reduce_only_rejected()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            elif (state == "REJECTED" or status == "REJECTED") and not o.is_taker:
                 self.n_reject += 1
-                self._backoff(o.side, now)
+                if "POST_ONLY" in str(reason).upper() or "WOULD_CROSS" in str(reason).upper():
+                    self.reject_until[o.side] = max(self.reject_until[o.side], now + 0.15)
+                else:
+                    self._backoff(o.side, now)
+            if not o.is_taker and (now - o.last_action < 1.0):
+                self.reject_until[o.side] = max(self.reject_until[o.side], now + 0.25)
             log.info("ORDER L%d %s %s %s", o.pair_index, o.side, state or status, reason)
             self._remove_order(o.order_id)
 
@@ -449,7 +601,12 @@ class OrderManager:
                     pass
             market_rows.append(r)
 
-        open_ids = {str(r.get("orderId") or r.get("id")) for r in market_rows}
+        open_ids = set()
+        for r in market_rows:
+            for k in ("orderId", "id", "clientOrderIndex", "client_order_index", "venueOrderIndex", "order_index"):
+                v = r.get(k)
+                if v is not None and str(v) != "0":
+                    open_ids.add(str(v))
         for o in list(self.orders.values()):
             if o.order_id not in open_ids and now - o.last_action > 5 and o.cancelling_since is None:
                 log.warning("dropping ghost L%d %s order %s", o.pair_index, o.side, o.order_id)
@@ -465,3 +622,125 @@ class OrderManager:
                 log.warning("cancelling orphan order %s for market %s (id %d)", oid, m.name, m.market_id)
                 reqs.append(self.ex.write(self.signer.cancel(m, oid)))
         await self._gather(reqs)
+
+
+    def on_dry_bbo(self, bid: Decimal, ask: Decimal, now: float) -> None:
+        """Simulates fills in DRY_RUN=1 when live BBO crosses or touches our resting paper orders."""
+        if not self.cfg.dry_run or not self.orders:
+            return
+        for o in list(self.orders.values()):
+            if o.is_taker or o.cancelling_since is not None or o.remaining <= ZERO:
+                continue
+            if (o.side == BUY and ask <= o.price) or (o.side == SELL and bid >= o.price):
+                new_cum = o.qty
+                self._apply(o, {
+                    "orderId": o.order_id, "state": "FILLED", "status": "FILLED",
+                    "price": str(o.price), "avgFillPrice": str(o.price),
+                    "filledSize": str(new_cum), "remainingSize": "0"
+                }, now)
+
+    def on_dry_trade(self, trade_side: str, trade_sz: Decimal, trade_px: Decimal, now: float) -> None:
+        """Simulates queue-aware fills in DRY_RUN=1 when live market trades hit or cross our paper orders."""
+        if not self.cfg.dry_run or not self.orders or trade_sz <= ZERO:
+            return
+        rem_flow = trade_sz
+        t_side = trade_side.upper()
+        # Sort resting orders by price priority
+        candidates = sorted(
+            [o for o in self.orders.values() if not o.is_taker and o.cancelling_since is None and o.remaining > ZERO],
+            key=lambda x: x.price if x.side == SELL else -x.price
+        )
+        for o in candidates:
+            if rem_flow <= ZERO:
+                break
+            if o.side == BUY:
+                # Trade printed at or below our bid price
+                if trade_px < o.price or (trade_px == o.price and t_side in ("SELL", "ASK")):
+                    if trade_px < o.price:
+                        o.queue_ahead = ZERO
+                    elif o.queue_ahead > ZERO:
+                        deplete = min(o.queue_ahead, rem_flow)
+                        o.queue_ahead -= deplete
+                        rem_flow -= deplete
+                    if rem_flow > ZERO and o.queue_ahead <= ZERO:
+                        fill_sz = min(o.remaining, rem_flow)
+                        rem_flow -= fill_sz
+                        new_cum = getattr(o, "cum_filled", ZERO) + fill_sz
+                        new_rem = max(ZERO, o.qty - new_cum)
+                        st = "FILLED" if new_rem <= ZERO else "PARTIALLY_FILLED"
+                        self._apply(o, {
+                            "orderId": o.order_id, "state": st, "status": st,
+                            "price": str(o.price), "avgFillPrice": str(o.price),
+                            "filledSize": str(new_cum), "remainingSize": str(new_rem)
+                        }, now)
+            else:
+                # Trade printed at or above our ask price
+                if trade_px > o.price or (trade_px == o.price and t_side in ("BUY", "BID")):
+                    if trade_px > o.price:
+                        o.queue_ahead = ZERO
+                    elif o.queue_ahead > ZERO:
+                        deplete = min(o.queue_ahead, rem_flow)
+                        o.queue_ahead -= deplete
+                        rem_flow -= deplete
+                    if rem_flow > ZERO and o.queue_ahead <= ZERO:
+                        fill_sz = min(o.remaining, rem_flow)
+                        rem_flow -= fill_sz
+                        new_cum = getattr(o, "cum_filled", ZERO) + fill_sz
+                        new_rem = max(ZERO, o.qty - new_cum)
+                        st = "FILLED" if new_rem <= ZERO else "PARTIALLY_FILLED"
+                        self._apply(o, {
+                            "orderId": o.order_id, "state": st, "status": st,
+                            "price": str(o.price), "avgFillPrice": str(o.price),
+                            "filledSize": str(new_cum), "remainingSize": str(new_rem)
+                        }, now)
+
+
+    def on_user_fill(self, c: dict, now: float) -> None:
+        """Reconciles exact execution price and exchange fee from the userFills channel."""
+        if not isinstance(c, dict):
+            return
+        oid = str(c.get("orderId") or c.get("id") or "")
+        if not oid:
+            return
+        # Extract true execution price and fee from userFills payload
+        exec_px = None
+        for k in ("price", "fillPrice", "avgFillPrice", "avgPrice", "matchedPrice", "execPrice"):
+            v = c.get(k)
+            if v is not None:
+                try:
+                    d = Decimal(str(v))
+                    if d > ZERO:
+                        exec_px = d
+                        break
+                except Exception:
+                    pass
+        fee_usd = None
+        for fk in ("fee", "commission", "feeUsd", "makerFee", "takerFee"):
+            fv = c.get(fk)
+            if fv is not None:
+                try:
+                    fee_usd = Decimal(str(fv))
+                    break
+                except Exception:
+                    pass
+
+        # If order is still open in self.orders and hasn't processed FILLED yet, update its price
+        o = self.orders.get(oid)
+        if o is not None and exec_px is not None:
+            o.price = exec_px
+
+        # If order was already booked via 'orders' channel at a stale limit price, adjust ledger realized PnL
+        rec_map = getattr(self, "_recent_filled_orders", None)
+        if rec_map and oid in rec_map and self.ledger is not None:
+            f_ts, f_side, f_qty, booked_px, _ = rec_map[oid]
+            if exec_px is not None and abs(exec_px - booked_px) > Decimal("1e-9"):
+                # Adjust realized or avg_cost for the difference between true exec_px and booked_px
+                px_diff = ( booked_px - exec_px ) if f_side == BUY else ( exec_px - booked_px )
+                pnl_adj = px_diff * f_qty
+                self.ledger.realized += pnl_adj
+                rec_map[oid] = (f_ts, f_side, f_qty, exec_px, _)
+                log.info("USER_FILL_SYNC order=%s adjusted fill_px %s -> %s (pnl_adj=$%s, total_realized=$%s)",
+                         oid, fmt(booked_px), fmt(exec_px), fmt(pnl_adj), fmt(self.ledger.realized))
+            if fee_usd is not None and fee_usd != ZERO:
+                self.ledger.fees += fee_usd
+                self.ledger.realized -= fee_usd

@@ -1,22 +1,85 @@
-"""All tunables live here (loaded from environment / .env)."""
+"""All tunables live here (loaded from environment / .env).
+Ported to Robinhood Lighter Perp DEX (https://apidocs.rh.lighter.xyz/docs/get-started).
+Supports both LIGHTER_* and ARCUS_* environment variables for full compatibility.
+"""
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Optional
 
 from utils import Fatal
 
+# Official Robinhood Lighter Perp DEX & Lighter Core Endpoints & Chain IDs
+# Ref:
+#   - https://apidocs.rh.lighter.xyz/docs/get-started
+#   - https://apidocs.lighter.xyz/docs/lighter-rh
+#   - https://apidocs.lighter.xyz/docs/environments
+#   - https://docs.robinhood.com/chain/lighter-domains/
 ENVS = {
-    "mainnet": {"rest": "https://api.arcus.xyz", "ws": "wss://api.arcus.xyz/v1/ws"},
-    "testnet": {"rest": "https://api.testnet.arcus.xyz", "ws": "wss://api.testnet.arcus.xyz/v1/ws"},
+    "mainnet": {
+        "rest": "https://api.rh.lighter.xyz",
+        "ws": "wss://api.rh.lighter.xyz/stream",
+        "chain_id": 466324,
+        "settlement_asset": "USDG",
+        "settlement_asset_index": 3,
+    },
+    "rh_mainnet": {
+        "rest": "https://api.rh.lighter.xyz",
+        "ws": "wss://api.rh.lighter.xyz/stream",
+        "chain_id": 466324,
+        "settlement_asset": "USDG",
+        "settlement_asset_index": 3,
+    },
+    "testnet": {
+        "rest": "https://api.rh-testnet.lighter.xyz",
+        "ws": "wss://api.rh-testnet.lighter.xyz/stream",
+        "chain_id": 300,
+        "settlement_asset": "USDG",
+        "settlement_asset_index": 3,
+    },
+    "rh_testnet": {
+        "rest": "https://api.rh-testnet.lighter.xyz",
+        "ws": "wss://api.rh-testnet.lighter.xyz/stream",
+        "chain_id": 300,
+        "settlement_asset": "USDG",
+        "settlement_asset_index": 3,
+    },
+    "lighter_mainnet": {
+        "rest": "https://mainnet.zklighter.elliot.ai",
+        "ws": "wss://mainnet.zklighter.elliot.ai/stream",
+        "chain_id": 304,
+        "settlement_asset": "USDC",
+        "settlement_asset_index": 3,
+    },
+    "lighter_testnet": {
+        "rest": "https://testnet.zklighter.elliot.ai",
+        "ws": "wss://testnet.zklighter.elliot.ai/stream",
+        "chain_id": 300,
+        "settlement_asset": "USDC",
+        "settlement_asset_index": 3,
+    },
 }
+
+# On Robinhood Lighter, API key indices 0-3 and 157 are reserved for official
+# desktop/mobile/web frontends. Indices 4-156 and 158-254 are available for programmatic trading.
+# Index 255 is the query sentinel for "all API keys".
+RH_RESERVED_API_KEY_INDICES = frozenset({0, 1, 2, 3, 157, 255})
 
 
 def _e(name: str, default):
     v = os.getenv(name)
     return default if v is None or v.strip() == "" else v.strip()
+
+
+def _e_any(names: list[str], default):
+    for name in names:
+        v = os.getenv(name)
+        if v is not None and v.strip() != "":
+            return v.strip()
+    return default
 
 
 def _d(name: str, default: str) -> Decimal:
@@ -25,7 +88,6 @@ def _d(name: str, default: str) -> Decimal:
 
 def _b(name: str, default: str) -> bool:
     return str(_e(name, default)).lower() in ("1", "true", "yes", "y", "on")
-
 
 
 def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Decimal]:
@@ -42,6 +104,7 @@ def _parse_guarantee_spread_capture(name: str, default: str) -> tuple[bool, Deci
     if s in ("1", "true", "yes", "on"):
         return True, Decimal("0.5")
     return False, Decimal("0")
+
 
 def _parse_weights(raw: str) -> dict:
     out = {}
@@ -190,6 +253,7 @@ class Config:
     quote_dataset_path: str
     enable_empirical_learner: bool
     empirical_prior_weight: int
+
     # --- Level 2 & Level 3 Quantitative MM Architecture ------------------- #
     enable_latent_state: bool
     enable_belief_state_quoting: bool
@@ -201,6 +265,7 @@ class Config:
     enable_cross_asset_hedger: bool
     cross_asset_rho: float
     enable_meta_learner: bool
+
     # --- Level 4 Advanced Research Architecture --------------------------- #
     enable_level4_control: bool
     enable_active_withdrawal: bool
@@ -254,23 +319,89 @@ class Config:
     cross_div_adverse_mult: float = 1.0
     cross_flow_weight: float = 0.3
 
+    # --- Robinhood Lighter Perp DEX Specific Configuration ----------------- #
+    api_key_index: int = 4
+    chain_id: int = 466324
+    rest_url: str = ""
+    ws_url: str = ""
+    settlement_asset: str = "USDG"
+    account_tier: str = "standard"       # "standard" (200ms post-only maker latency on RH) or "premium" (0ms)
+    maker_latency_ms: int = 200          # 200ms on RH Standard, 0ms on RH Premium
+    skip_nonce: bool = False             # L2TxAttributes skip_nonce flag
+    signer_lib_path: str = ""            # Optional path to lighter-signer shared library (.so/.dylib/.dll)
+    prefer_ws_tx: bool = True            # Send signed txs via WS jsonapi/sendtx(batch) with REST /api/v1/sendTx fallback
+    use_grouped_orders: bool = False     # Optional L2CreateGroupedOrders (TxType 28) support
+    log_level: str = "INFO"
+
+    def validate(self) -> list[str]:
+        errs: list[str] = []
+        if self.env_name not in ENVS:
+            errs.append(f"env_name '{self.env_name}' not in {list(ENVS)}")
+        if self.env_name in ("mainnet", "rh_mainnet", "testnet", "rh_testnet"):
+            if self.api_key_index in RH_RESERVED_API_KEY_INDICES or not (0 <= self.api_key_index <= 254):
+                errs.append(
+                    f"API_KEY_INDEX {self.api_key_index} is reserved on Robinhood Lighter "
+                    "(indices 0-3 and 157 are reserved; 255 is query sentinel; use 4..156 or 158..254)"
+                )
+        if self.max_position_usd < self.order_usd:
+            errs.append("MAX_POSITION_USD must be >= ORDER_USD")
+        return errs
+
     @classmethod
     def from_env(cls) -> "Config":
-        env_name = str(_e("ARCUS_ENV", "testnet")).lower()
+        env_name = str(_e_any(["LIGHTER_ENV", "ARCUS_ENV"], "testnet")).lower()
         if env_name not in ENVS:
-            raise Fatal(f"ARCUS_ENV must be one of {list(ENVS)}")
-        address = str(_e("ARCUS_WALLET_ADDRESS", ""))
-        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
-            raise Fatal("ARCUS_WALLET_ADDRESS must be your 0x master wallet address")
-        key = str(_e("ARCUS_API_SIGNING_KEY", "")).removeprefix("0x")
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
-            raise Fatal("ARCUS_API_SIGNING_KEY must be the 64-hex Ed25519 private key")
+            raise Fatal(f"LIGHTER_ENV / ARCUS_ENV must be one of {list(ENVS)}")
+        ep = ENVS[env_name]
+
+        address = str(_e_any(["LIGHTER_WALLET_ADDRESS", "ARCUS_WALLET_ADDRESS"], ""))
+        account_index = int(_e_any(["LIGHTER_ACCOUNT_INDEX", "ARCUS_ACCOUNT_INDEX"], 0))
+        api_key_index = int(_e_any(["LIGHTER_API_KEY_INDEX", "ARCUS_API_KEY_INDEX"], 4))
+
+        if env_name in ("mainnet", "rh_mainnet", "testnet", "rh_testnet"):
+            if api_key_index in RH_RESERVED_API_KEY_INDICES or not (0 <= api_key_index <= 254):
+                raise Fatal(
+                    f"LIGHTER_API_KEY_INDEX={api_key_index} is reserved on Robinhood Lighter "
+                    "(indices 0-3 and 157 are reserved for frontends; 255 is query sentinel; use 4..156 or 158..254)"
+                )
+
+        # Address is validated if provided, or required if account_index is not explicitly set (> 0)
+        if address:
+            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+                raise Fatal("LIGHTER_WALLET_ADDRESS / ARCUS_WALLET_ADDRESS must be a valid 0x 40-hex Ethereum/Arbitrum L1 address")
+        elif account_index <= 0:
+            raise Fatal("Set LIGHTER_WALLET_ADDRESS (or ARCUS_WALLET_ADDRESS) or LIGHTER_ACCOUNT_INDEX > 0")
+        else:
+            # Synthesize deterministic placeholder L1 address when only LIGHTER_ACCOUNT_INDEX is configured
+            address = f"0x{account_index:040x}"
+
+        key = str(_e_any(["LIGHTER_API_PRIVATE_KEY", "LIGHTER_API_SIGNING_KEY", "ARCUS_API_SIGNING_KEY"], "")).removeprefix("0x")
+        # Lighter API private keys are 40-byte (80 hex chars) Schnorr/ECgFp5 keys; also accept 32-byte (64 hex chars) keys
+        if not re.fullmatch(r"[0-9a-fA-F]{64}|[0-9a-fA-F]{80}", key):
+            raise Fatal(
+                "LIGHTER_API_PRIVATE_KEY / ARCUS_API_SIGNING_KEY must be an 80-hex (40-byte Lighter API key) "
+                "or 64-hex (32-byte) private key"
+            )
+
         dry = _b("DRY_RUN", "1")
         market = str(_e("MARKET", "BTC-USD"))
         guar_sc, guar_sc_bps = _parse_guarantee_spread_capture("GUARANTEE_SPREAD_CAPTURE", "1")
+
+        rest_url = str(_e_any(["LIGHTER_REST_URL", "ARCUS_REST_URL"], ep["rest"])).rstrip("/")
+        ws_url = str(_e_any(["LIGHTER_WS_URL", "ARCUS_WS_URL"], ep["ws"])).rstrip("/")
+        chain_id = int(_e_any(["LIGHTER_CHAIN_ID", "ARCUS_CHAIN_ID"], ep["chain_id"]))
+        settlement_asset = str(_e_any(["LIGHTER_SETTLEMENT_ASSET"], ep["settlement_asset"]))
+        account_tier = str(_e_any(["LIGHTER_ACCOUNT_TIER", "ACCOUNT_TIER"], "standard")).lower()
+        default_maker_lat = 0 if account_tier == "premium" else 200
+        maker_latency_ms = int(_e_any(["MAKER_LATENCY_MS", "LIGHTER_MAKER_LATENCY_MS"], default_maker_lat))
+
         cfg = cls(
-            env_name=env_name, address=address, signing_key=key,
-            account_index=int(_e("ARCUS_ACCOUNT_INDEX", 0)), market=market, dry_run=dry,
+            env_name=env_name,
+            address=address,
+            signing_key=key,
+            account_index=account_index,
+            market=market,
+            dry_run=dry,
             order_usd=_d("ORDER_USD", "30"),
             max_position_usd=_d("MAX_POSITION_USD", "60"),
             skew_bps=_d("SKEW_BPS", "3"),
@@ -434,6 +565,18 @@ class Config:
             cross_liq_usd=float(_e("CROSS_LIQ_USD", 50000)),
             cross_div_adverse_mult=float(_e("CROSS_DIV_ADVERSE_MULT", 1.0)),
             cross_flow_weight=float(_e("CROSS_FLOW_WEIGHT", 0.3)),
+            api_key_index=api_key_index,
+            chain_id=chain_id,
+            rest_url=rest_url,
+            ws_url=ws_url,
+            settlement_asset=settlement_asset,
+            account_tier=account_tier,
+            maker_latency_ms=maker_latency_ms,
+            skip_nonce=_b("LIGHTER_SKIP_NONCE", "0"),
+            signer_lib_path=str(_e_any(["LIGHTER_SIGNER_LIB_PATH", "SIGNER_LIB_PATH"], "")),
+            prefer_ws_tx=_b("LIGHTER_PREFER_WS_TX", "1"),
+            use_grouped_orders=_b("LIGHTER_USE_GROUPED_ORDERS", "0"),
+            log_level=str(_e("LOG_LEVEL", "INFO")),
         )
         if cfg.max_position_usd < cfg.order_usd:
             raise Fatal("MAX_POSITION_USD must be >= ORDER_USD")

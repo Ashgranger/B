@@ -29,23 +29,77 @@ class Market:
     is_outside_rth: bool
     funding_rate: Decimal = Decimal(0)
     next_funding_time: float = 0.0
+    symbol: str = ""
+    price_decimals: int = 2
+    size_decimals: int = 4
+    quote_decimals: int = 6
+    maker_fee: Decimal = Decimal(0)
+    taker_fee: Decimal = Decimal(0)
 
     @classmethod
     def from_api(cls, d: dict) -> "Market":
+        mkt_id = int(d["market_id"] if "market_id" in d else d["marketId"])
+        sym = str(d.get("symbol") or d.get("marketDisplayName") or f"MKT-{mkt_id}")
+        disp_name = str(d.get("marketDisplayName") or sym)
+        raw_status = str(d.get("status", "ONLINE")).upper()
+        norm_status = "ONLINE" if raw_status in ("ONLINE", "ACTIVE", "1", "TRUE") else raw_status
+
+        p_dec = d.get("price_decimals") if d.get("price_decimals") is not None else d.get("supported_price_decimals")
+        s_dec = d.get("size_decimals") if d.get("size_decimals") is not None else d.get("supported_size_decimals")
+        q_dec = d.get("quote_decimals") if d.get("quote_decimals") is not None else d.get("supported_quote_decimals", 6)
+
+        if "tickSize" in d and d["tickSize"] is not None:
+            tick_val = Decimal(str(d["tickSize"]))
+            p_dec_int = int(p_dec) if p_dec is not None else max(0, -tick_val.normalize().as_tuple().exponent)
+        else:
+            p_dec_int = int(p_dec) if p_dec is not None else 2
+            tick_val = Decimal(10) ** (-p_dec_int)
+
+        if "stepSize" in d and d["stepSize"] is not None:
+            step_val = Decimal(str(d["stepSize"]))
+            s_dec_int = int(s_dec) if s_dec is not None else max(0, -step_val.normalize().as_tuple().exponent)
+        else:
+            s_dec_int = int(s_dec) if s_dec is not None else 4
+            step_val = Decimal(10) ** (-s_dec_int)
+
+        min_notional_raw = d.get("min_quote_amount") if d.get("min_quote_amount") is not None else d.get("minOrderNotional", "0")
+        min_size_raw = d.get("min_base_amount") if d.get("min_base_amount") is not None else d.get("minOrderSize", "0")
+        max_size_raw = d.get("max_base_amount") if d.get("max_base_amount") is not None else d.get("maxOrderSize", "0")
+        mark_raw = (
+            d.get("mark_price")
+            or d.get("markPrice")
+            or d.get("index_price")
+            or d.get("last_trade_price")
+            or "0"
+        )
+        fr_raw = (
+            d.get("current_funding_rate")
+            or d.get("funding_rate")
+            or d.get("fundingRate")
+            or "0"
+        )
+        nft_raw = d.get("funding_timestamp") or d.get("nextFundingTime") or d.get("next_funding_time") or 0.0
+
         return cls(
-            market_id=int(d["marketId"]),
-            name=d["marketDisplayName"],
-            status=str(d.get("status", "ONLINE")).upper(),
-            tick=Decimal(str(d["tickSize"])),
-            step=Decimal(str(d["stepSize"])),
+            market_id=mkt_id,
+            name=disp_name,
+            status=norm_status,
+            tick=tick_val,
+            step=step_val,
             tiers=list(d.get("tickTiers") or []),
-            min_notional=Decimal(str(d.get("minOrderNotional") or "0")),
-            min_size=Decimal(str(d.get("minOrderSize") or "0")),
-            max_size=Decimal(str(d.get("maxOrderSize") or "0")),
-            mark=Decimal(str(d.get("markPrice") or "0")),
-            is_outside_rth=bool(d.get("isOutsideRth")),
-            funding_rate=Decimal(str(d.get("fundingRate") or d.get("funding_rate") or "0")),
-            next_funding_time=float(d.get("nextFundingTime") or d.get("next_funding_time") or 0.0),
+            min_notional=Decimal(str(min_notional_raw or "0")),
+            min_size=Decimal(str(min_size_raw or "0")),
+            max_size=Decimal(str(max_size_raw or "0")),
+            mark=Decimal(str(mark_raw or "0")),
+            is_outside_rth=bool(d.get("isOutsideRth", False)),
+            funding_rate=Decimal(str(fr_raw or "0")),
+            next_funding_time=float(nft_raw or 0.0),
+            symbol=sym.split("-")[0],
+            price_decimals=p_dec_int,
+            size_decimals=s_dec_int,
+            quote_decimals=int(q_dec or 6),
+            maker_fee=Decimal(str(d.get("maker_fee") or "0")),
+            taker_fee=Decimal(str(d.get("taker_fee") or "0")),
         )
 
     def tick_for(self, price: Decimal) -> Decimal:
@@ -374,9 +428,15 @@ class MarketData:
         self._trades: deque = deque()
         self._tfi_cache: dict = {}
         self._tfi_now = None
+        self._ret_cache: dict = {}
+        self._move_cache: dict = {}
+        self._cons_cache: dict = {}
         self._vol_ewma = ZERO
         self._book_depth_bids: list = []
         self._book_depth_asks: list = []
+        self._l2_bids_map: dict[Decimal, Decimal] = {}
+        self._l2_asks_map: dict[Decimal, Decimal] = {}
+        self._ob_nonce: Optional[int] = None
         self.cross = CrossVenueTracker(cfg)
         self.funding_rate: Decimal = ZERO
         self.next_funding_time: float = 0.0
@@ -386,11 +446,14 @@ class MarketData:
         self.latent_estimator = LatentStateEstimator(cfg)
         self.belief_state: BeliefState = self.latent_estimator.belief
         self.latent_state: LatentState = self.latent_estimator.state
+        self._excl_cfg: bool = bool(getattr(cfg, "exclude_own_orders", False))
+        self._mid_cache_pair = (None, None)
+        self._mid_cache_val: Optional[Decimal] = None
 
     # ---------------- own-order exclusion ----------------
     @property
     def _excl(self) -> bool:
-        return bool(getattr(self.cfg, "exclude_own_orders", False)) and self.own_provider is not None
+        return self._excl_cfg and self.own_provider is not None
 
     def _own_at(self, side: str, price: Decimal) -> Decimal:
         if not self._excl:
@@ -460,14 +523,21 @@ class MarketData:
         self.bid = self.ask = self.bid_sz = self.ask_sz = None
         self._book_depth_bids.clear()
         self._book_depth_asks.clear()
+        self._l2_bids_map.clear()
+        self._l2_asks_map.clear()
+        self._ob_nonce = None
 
     def update(self, bid: Decimal, ask: Decimal, bid_sz: Optional[Decimal],
                ask_sz: Optional[Decimal], now: float) -> None:
         prev = self.mid
         self.bid, self.ask, self.bid_sz, self.ask_sz, self.ts = bid, ask, bid_sz, ask_sz, now
+        self._ret_cache.clear()
+        self._move_cache.clear()
         mid = self.mid
         if prev and mid and bid < ask:
-            if abs(mid - prev) / prev * BPS >= self.cfg.jump_bps:
+            tick_bps = (self.info.tick_for(mid) / mid * BPS) if (self.info and mid > 0) else Decimal("0.5")
+            eff_jump_bps = max(self.cfg.jump_bps, tick_bps * Decimal("6.0"))
+            if abs(mid - prev) / prev * BPS >= eff_jump_bps:
                 self.jump_until = now + self.cfg.jump_cooldown_s
         if bid < ask and self.cross.venues:
             self.cross.observe_local(mid, now)
@@ -506,17 +576,82 @@ class MarketData:
     def on_trade(self, side: str, size: Decimal, price: Decimal, now: float) -> None:
         self._trades.append((now, side.upper(), size, price))
         self._tfi_cache.clear()
+        self._cons_cache.clear()
         self._tfi_now = None
         while self._trades and now - self._trades[0][0] > 60.0:
             self._trades.popleft()
 
     def on_depth(self, bids: list, asks: list, now: float) -> None:
         try:
-            self._book_depth_bids = [(_D(r[0]), _D(r[1])) for r in bids]
-            self._book_depth_asks = [(_D(r[0]), _D(r[1])) for r in asks]
+            def _extract(row):
+                if isinstance(row, dict):
+                    return (_D(row["price"]), _D(row.get("size") or row.get("remaining_base_amount") or "0"))
+                return (_D(row[0]), _D(row[1]))
+            self._book_depth_bids = [_extract(r) for r in bids[:20]]
+            self._book_depth_asks = [_extract(r) for r in asks[:20]]
         except Exception:
-            self._book_depth_bids = bids
-            self._book_depth_asks = asks
+            self._book_depth_bids = bids[:20]
+            self._book_depth_asks = asks[:20]
+
+    def apply_lighter_order_book(self, ob: dict, is_snapshot: bool, now: float) -> bool:
+        """Maintain Lighter incremental L2 orderbook from `order_book/{MARKET_INDEX}` stream.
+        Returns True if sequence is valid, or False if a `begin_nonce` gap requires resubscription.
+        """
+        if not isinstance(ob, dict):
+            return True
+        nonce = ob.get("nonce")
+        begin_nonce = ob.get("begin_nonce")
+        if is_snapshot:
+            self._l2_bids_map.clear()
+            self._l2_asks_map.clear()
+            self._ob_nonce = int(nonce) if nonce is not None else None
+        else:
+            if self._ob_nonce is not None and begin_nonce is not None:
+                b_n = int(begin_nonce)
+                if b_n > self._ob_nonce:
+                    # Missed intermediate delta batch -> signal caller to resubscribe
+                    return False
+                if nonce is not None and int(nonce) <= self._ob_nonce:
+                    # Already applied this or newer batch
+                    return True
+            if nonce is not None:
+                self._ob_nonce = int(nonce)
+
+        for row in ob.get("bids") or []:
+            if isinstance(row, dict) and "price" in row:
+                px, sz = _D(row["price"]), _D(row.get("size", "0"))
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                px, sz = _D(row[0]), _D(row[1])
+            else:
+                continue
+            if sz <= ZERO:
+                self._l2_bids_map.pop(px, None)
+            else:
+                self._l2_bids_map[px] = sz
+
+        for row in ob.get("asks") or []:
+            if isinstance(row, dict) and "price" in row:
+                px, sz = _D(row["price"]), _D(row.get("size", "0"))
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                px, sz = _D(row[0]), _D(row[1])
+            else:
+                continue
+            if sz <= ZERO:
+                self._l2_asks_map.pop(px, None)
+            else:
+                self._l2_asks_map[px] = sz
+
+        sorted_bids = sorted(self._l2_bids_map.items(), key=lambda kv: kv[0], reverse=True)
+        sorted_asks = sorted(self._l2_asks_map.items(), key=lambda kv: kv[0])
+        self._book_depth_bids = sorted_bids[:20]
+        self._book_depth_asks = sorted_asks[:20]
+
+        if sorted_bids and sorted_asks:
+            best_bid, best_bid_sz = sorted_bids[0]
+            best_ask, best_ask_sz = sorted_asks[0]
+            if best_bid < best_ask:
+                self.update(best_bid, best_ask, best_bid_sz, best_ask_sz, now)
+        return True
 
     def update_cross_venue(self, venue: str, bid: Decimal, ask: Decimal,
                            bid_sz: Decimal, ask_sz: Decimal, now: float) -> None:
@@ -535,7 +670,16 @@ class MarketData:
 
     @property
     def mid(self) -> Optional[Decimal]:
-        return (self.bid + self.ask) / 2 if self.bid is not None and self.ask is not None else None
+        b, a = self.bid, self.ask
+        if b is None or a is None:
+            return None
+        pair = (b, a)
+        if self._mid_cache_pair == pair:
+            return self._mid_cache_val
+        val = (b + a) * Decimal("0.5")
+        self._mid_cache_pair = pair
+        self._mid_cache_val = val
+        return val
 
     @property
     def micro(self) -> Optional[Decimal]:
@@ -590,6 +734,10 @@ class MarketData:
         return [m for t, m in self._hist if now - t <= window_s]
 
     def ret_bps(self, window_s: float, now: float) -> Decimal:
+        key = (window_s, now, len(self._hist), self._hist[-1][1] if self._hist else None)
+        hit = self._ret_cache.get(key)
+        if hit is not None:
+            return hit
         newest = oldest = None
         n = 0
         for t, m in reversed(self._hist):
@@ -599,11 +747,15 @@ class MarketData:
                 newest = m
             oldest = m
             n += 1
-        if n < 2 or oldest == 0:
-            return ZERO
-        return (newest - oldest) / oldest * BPS
+        res = ZERO if (n < 2 or not oldest) else (newest - oldest) / oldest * BPS
+        self._ret_cache[key] = res
+        return res
 
     def move_bps(self, window_s: float, now: float) -> Decimal:
+        key = (window_s, now, len(self._hist), self._hist[-1][1] if self._hist else None)
+        hit = self._move_cache.get(key)
+        if hit is not None:
+            return hit
         newest = oldest = hi = lo = None
         n = 0
         for t, m in reversed(self._hist):
@@ -618,11 +770,9 @@ class MarketData:
                     lo = m
             oldest = m
             n += 1
-        if n < 2:
-            return ZERO
-        if oldest == 0:
-            return ZERO
-        return (hi - lo) / newest * BPS
+        res = ZERO if (n < 2 or not oldest) else (hi - lo) / newest * BPS
+        self._move_cache[key] = res
+        return res
 
     @property
     def vol_bps(self) -> Decimal:
@@ -643,37 +793,46 @@ class MarketData:
         """Calculates resting queue depth ahead of (and at) our quote price on the given side."""
         if side in ("BUY", "BID"):
             if not self._book_depth_bids:
-                return self.top_size("BUY") or Decimal("1")
+                return self.top_size("BUY") or ONE
             ahead = ZERO
-            for row in self.depth_levels("BUY"):
-                p, sz = _D(row[0]), _D(row[1])
-                if p >= price:
-                    ahead += sz
+            for p, sz in self.depth_levels("BUY"):
+                p_d = p if isinstance(p, Decimal) else _D(p)
+                if p_d >= price:
+                    ahead += (sz if isinstance(sz, Decimal) else _D(sz))
                 else:
                     break
-            return ahead if ahead > ZERO else (self.top_size("BUY") or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("BUY") or ONE)
         else:
             if not self._book_depth_asks:
-                return self.top_size("SELL") or Decimal("1")
+                return self.top_size("SELL") or ONE
             ahead = ZERO
-            for row in self.depth_levels("SELL"):
-                p, sz = _D(row[0]), _D(row[1])
-                if p <= price:
-                    ahead += sz
+            for p, sz in self.depth_levels("SELL"):
+                p_d = p if isinstance(p, Decimal) else _D(p)
+                if p_d <= price:
+                    ahead += (sz if isinstance(sz, Decimal) else _D(sz))
                 else:
                     break
-            return ahead if ahead > ZERO else (self.top_size("SELL") or Decimal("1"))
+            return ahead if ahead > ZERO else (self.top_size("SELL") or ONE)
 
     def consumption_rate(self, side: str, window_s: float, now: float) -> Decimal:
         """Aggressive trade volume hitting the given book side per second."""
+        is_bid = side in ("BUY", "BID")
+        key = (is_bid, window_s, now)
+        hit = self._cons_cache.get(key)
+        if hit is not None:
+            return hit
+        if len(self._cons_cache) > 32:
+            self._cons_cache.clear()
         vol = ZERO
-        target_trade_side = "SELL" if side in ("BUY", "BID") else "BUY"
+        target_trade_side = "SELL" if is_bid else "BUY"
         for t, s, sz, _ in reversed(self._trades):
             if now - t > window_s:
                 break
             if s == target_trade_side:
                 vol += sz
-        return vol / Decimal(str(max(0.1, window_s)))
+        res = vol / Decimal(str(max(0.1, window_s)))
+        self._cons_cache[key] = res
+        return res
 
     def liquidity_fragility(self, side: str, now: float) -> Decimal:
         """Ratio of aggressive counter-flow volume (1s) to available resting depth (L1-L5).
