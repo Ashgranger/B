@@ -675,7 +675,12 @@ class MarketMaker:
         self._last_heartbeat = now
         try:
             deadline_us = int((time.time() + cfg.dms_ttl_s) * 1_000_000)
-            resp = await self.ex.write(self.signer.schedule_cancel(self.md.info, deadline_us))
+            use_lock = not cfg.dry_run and getattr(self.ex, "ws", None) is not None and hasattr(self.ex.ws, "transport") and hasattr(self.om, "_tx_lock")
+            if use_lock:
+                async with self.om._tx_lock:
+                    resp = await self.ex.write(self.signer.schedule_cancel(self.md.info, deadline_us))
+            else:
+                resp = await self.ex.write(self.signer.schedule_cancel(self.md.info, deadline_us))
             ok = (isinstance(resp, dict) and resp.get("status") in (200, 202)
                   and not resp.get("error"))
             if ok:
@@ -907,10 +912,13 @@ class MarketMaker:
             self.ledger.learner.save_interval = 1.0  # keep disk I/O off the hot path
         log.info("Connecting to %s Robinhood Lighter Perp DEX (%s)...", self.cfg.env_name, self.ex.ws_url)
         if not self.cfg.dry_run:
-            if self.cfg.account_index <= 0 and hasattr(self.ex, "resolve_account_index"):
-                await self.ex.resolve_account_index()
-            if hasattr(self.ex, "fetch_next_nonce"):
-                await self.ex.fetch_next_nonce()
+            if hasattr(self.ex, "verify_and_sync_credentials"):
+                await self.ex.verify_and_sync_credentials()
+            else:
+                if self.cfg.account_index <= 0 and hasattr(self.ex, "resolve_account_index"):
+                    await self.ex.resolve_account_index()
+                if hasattr(self.ex, "fetch_next_nonce"):
+                    await self.ex.fetch_next_nonce()
         raw_markets = await self.ex.fetch_markets(self.cfg.market)
         self.md.info = Market.from_api(raw_markets[0])
         self.md.info_ts = self.now()
@@ -937,12 +945,13 @@ class MarketMaker:
 
         while not self.stop_evt.is_set():
             reader_task = None
+            keepalive_task = None
             try:
-                log.info("Connecting to Arcus WebSocket (%s)...", self.ex.ws_url)
+                log.info("Connecting to Robinhood Lighter WebSocket (%s)...", self.ex.ws_url)
                 async with websockets.connect(
                     self.ex.ws_url,
-                    ping_interval=15,
-                    ping_timeout=20,
+                    ping_interval=None,
+                    ping_timeout=None,
                     max_size=2**23,
                     close_timeout=5,
                     compression=None
@@ -957,6 +966,8 @@ class MarketMaker:
 
                     self.ex.ws = ws
                     reader_task = asyncio.create_task(self.ex.reader())
+                    if hasattr(self.ex, "keepalive_loop"):
+                        keepalive_task = asyncio.create_task(self.ex.keepalive_loop(20.0))
 
                     if hasattr(self.ex, "subscribe_lighter_feeds"):
                         await self.ex.subscribe_lighter_feeds(self.md.info.market_id, self.cfg.account_index)
@@ -1006,6 +1017,12 @@ class MarketMaker:
                 for _t in self._bg_tasks.values():
                     if not _t.done():
                         _t.cancel()
+                if keepalive_task and not keepalive_task.done():
+                    keepalive_task.cancel()
+                    try:
+                        await keepalive_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 if reader_task and not reader_task.done():
                     reader_task.cancel()
                     try:

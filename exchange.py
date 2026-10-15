@@ -141,6 +141,20 @@ class Exchange:
         """Send Lighter application-level WebSocket keepalive ping."""
         return await self._send({"type": "ping"})
 
+    async def keepalive_loop(self, interval_s: float = 20.0) -> None:
+        """Dedicated background task sending application-level `{"type": "ping"}` every 20s."""
+        try:
+            while self.is_connected:
+                await asyncio.sleep(interval_s)
+                if not self.is_connected:
+                    break
+                if self.ws is not None and hasattr(self.ws, "transport"):
+                    await self.send_ping()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.debug("keepalive_loop exited: %s", e)
+
     async def call(self, kind: str, request: dict, timeout: float = 10.0) -> dict:
         if not self.is_connected and not self.cfg.dry_run:
             return {"status": 503, "error": {"type": "NOT_CONNECTED", "message": "WebSocket not connected"}}
@@ -204,6 +218,14 @@ class Exchange:
                     self.signer.register_order_mapping(oid, coi)
                 return {"status": 202, "result": {"orderId": oid, "clientOrderIndex": coi, "status": "ACK"}}
             return {"status": 202, "result": {"status": "ACK"}}
+
+        if request.get("signer_error"):
+            if self.signer is not None and hasattr(self.signer, "rollback_nonce"):
+                self.signer.rollback_nonce()
+            return {
+                "status": 400,
+                "error": {"code": 21120, "message": str(request["signer_error"])},
+            }
 
         # In live mode: if WS is connected and prefer_ws_tx is True (or in mock WS unit tests), send over WS
         prefer_ws = getattr(self.cfg, "prefer_ws_tx", True)
@@ -788,7 +810,7 @@ class Exchange:
         """REST GET /api/v1/nextNonce?account_index={ai}&api_key_index={aki}."""
         ai = int(account_index if account_index is not None else self.cfg.account_index)
         aki = int(api_key_index if api_key_index is not None else getattr(self.cfg, "api_key_index", 4))
-        if ai <= 0:
+        if ai < 0:
             return None
 
         def _get():
@@ -805,30 +827,137 @@ class Exchange:
             self.signer.set_nonce(nonce)
         return nonce
 
-    async def resolve_account_index(self) -> Optional[int]:
-        """Resolve `account_index` from `cfg.address` via GET /api/v1/accountsByL1Address?l1_address=0x..."""
-        if self.cfg.account_index > 0:
+    async def resolve_account_index(self, verify_existing: bool = True) -> Optional[int]:
+        """Resolve and verify `account_index` from `cfg.address` via GET /api/v1/accountsByL1Address."""
+        addr = (self.cfg.address or "").strip()
+        is_placeholder_addr = (
+            not addr.startswith("0x")
+            or addr.lower() in ("0x" + "0" * 40, "0x" + "1" * 40)
+            or addr.lower() == f"0x{self.cfg.account_index:040x}"
+        )
+        if self.cfg.account_index > 0 and (not verify_existing or is_placeholder_addr):
             return self.cfg.account_index
-        if not self.cfg.address or not self.cfg.address.startswith("0x"):
-            return None
+        if is_placeholder_addr:
+            return self.cfg.account_index if self.cfg.account_index > 0 else None
 
-        def _get():
-            try:
-                data = self._http_get_json(f"/api/v1/accountsByL1Address?l1_address={self.cfg.address}")
-                if isinstance(data, dict):
-                    subs = data.get("sub_accounts") or data.get("accounts") or []
-                    if subs and isinstance(subs[0], dict) and subs[0].get("index") is not None:
-                        return int(subs[0]["index"])
-            except Exception as e:
-                log.debug("resolve_account_index failed: %s", e)
-            return None
+        def _get_sub_accounts() -> list[int]:
+            indices: list[int] = []
+            for path in (
+                f"/api/v1/accountsByL1Address?l1_address={addr}",
+                f"/api/v1/account?by=l1_address&value={addr}",
+            ):
+                try:
+                    data = self._http_get_json(path)
+                    if isinstance(data, dict):
+                        subs = data.get("sub_accounts") or data.get("accounts") or []
+                        for s in subs:
+                            if isinstance(s, dict):
+                                idx_val = s.get("index") if s.get("index") is not None else s.get("account_index")
+                                if idx_val is not None:
+                                    indices.append(int(idx_val))
+                        if indices:
+                            return indices
+                except Exception as e:
+                    log.debug("Account lookup on %s failed: %s", path, e)
+            return indices
 
-        idx = await asyncio.to_thread(_get)
-        if idx is not None:
-            self.cfg.account_index = idx
+        valid_indices = await asyncio.to_thread(_get_sub_accounts)
+        if valid_indices:
+            if self.cfg.account_index in valid_indices:
+                resolved = self.cfg.account_index
+            elif 0 <= self.cfg.account_index < len(valid_indices):
+                # User specified subaccount ordinal (e.g. ARCUS_ACCOUNT_INDEX=0) -> map to Lighter global account_index
+                resolved = valid_indices[self.cfg.account_index]
+                log.info(
+                    "Mapped subaccount ordinal %d -> Lighter global account_index=%d for wallet %s (all accounts: %s)",
+                    self.cfg.account_index, resolved, addr, valid_indices,
+                )
+            else:
+                resolved = valid_indices[0]
+                log.info(
+                    "Resolved Lighter global account_index=%d for wallet %s (configured %d was not in %s)",
+                    resolved, addr, self.cfg.account_index, valid_indices,
+                )
+            self.cfg.account_index = resolved
             if self.signer is not None:
-                self.signer.ai = idx
-        return idx
+                if hasattr(self.signer, "reinit_client"):
+                    self.signer.reinit_client(account_index=resolved)
+                else:
+                    self.signer.ai = resolved
+            return resolved
+        return self.cfg.account_index if self.cfg.account_index > 0 else None
+
+    async def verify_and_sync_credentials(self) -> bool:
+        """Resolve account_index, verify API key match on server via CheckClient / /api/v1/apikeys, and sync nonce."""
+        await self.resolve_account_index(verify_existing=True)
+
+        if self.signer is not None and hasattr(self.signer, "reinit_client"):
+            await asyncio.to_thread(
+                self.signer.reinit_client,
+                self.cfg.account_index,
+                self.cfg.api_key_index,
+                self.rest,
+                self.cfg.chain_id,
+            )
+
+        # Verify that (account_index, api_key_index) matches our local private key on the server
+        if self.signer is not None and hasattr(self.signer, "check_client") and self. signer.uses_native_c_signer:
+            err = await asyncio.to_thread(self.signer.check_client)
+            if err:
+                log.warning(
+                    "CheckClient failed for account_index=%d, api_key_index=%d: %s - querying /api/v1/apikeys to auto-detect key slot...",
+                    self.cfg.account_index, self.cfg.api_key_index, err,
+                )
+                def _find_matching_key_slot() -> Optional[int]:
+                    try:
+                        data = self._http_get_json(f"/api/v1/apikeys?account_index={self.cfg.account_index}&api_key_index=255")
+                        if isinstance(data, dict):
+                            keys = data.get("api_keys") or data.get("apikeys") or []
+                            active_slots = [
+                                int(k.get("api_key_index"))
+                                for k in keys
+                                if isinstance(k, dict)
+                                and k.get("api_key_index") is not None
+                                and str(k.get("public_key") or "").strip("0x") != ""
+                                and set(str(k.get("public_key") or "").strip("0x")) != {"0"}
+                            ]
+                            if active_slots:
+                                log.info("Registered non-zero api_key_index slots on account %d: %s", self.cfg.account_index, active_slots)
+                            for slot in active_slots:
+                                self.signer.reinit_client(account_index=self.cfg.account_index, api_key_index=slot)
+                                if self.signer.check_client() is None:
+                                    return slot
+                            # Restore configured api_key_index if none matched
+                            self.signer.reinit_client(account_index=self.cfg.account_index, api_key_index=self.cfg.api_key_index)
+                    except Exception as e:
+                        log.debug("Failed to probe /api/v1/apikeys: %s", e)
+                    return None
+
+                matched_slot = await asyncio.to_thread(_find_matching_key_slot)
+                if matched_slot is not None:
+                    log.info(
+                        "Auto-detected matching LIGHTER_API_KEY_INDEX=%d for account_index=%d (updated from %d)",
+                        matched_slot, self.cfg.account_index, self.cfg.api_key_index,
+                    )
+                    self.cfg.api_key_index = matched_slot
+                else:
+                    log.error(
+                        "CREDENTIAL MISMATCH on Robinhood Lighter: Private key does not match account_index=%d, api_key_index=%d (%s). "
+                        "Ensure LIGHTER_API_PRIVATE_KEY is your 80-hex (40-byte) Lighter API private key, "
+                        "LIGHTER_ACCOUNT_INDEX is your Robinhood Lighter account index, and LIGHTER_API_KEY_INDEX matches the slot registered on https://robinhoodchain.lighter.xyz.",
+                        self.cfg.account_index, self.cfg.api_key_index, err,
+                    )
+            else:
+                log.info(
+                    "Verified Lighter API key signature with server: account_index=%d, api_key_index=%d OK",
+                    self.cfg.account_index, self.cfg.api_key_index,
+                )
+
+        nonce = await self.fetch_next_nonce(self.cfg.account_index, self.cfg.api_key_index)
+        if nonce is not None:
+            log.info("Synchronized initial Lighter nonce=%d for (account_index=%d, api_key_index=%d)",
+                     nonce, self.cfg.account_index, self.cfg.api_key_index)
+        return True
 
     async def fetch_account(self) -> Optional[dict]:
         """REST GET /api/v1/account?by=index&value={account_index} (or by=l1_address&value={address})."""

@@ -4,20 +4,8 @@ References:
   - https://apidocs.rh.lighter.xyz/docs/get-started
   - https://apidocs.lighter.xyz/docs/lighter-rh
   - https://apidocs.lighter.xyz/docs/trading
-  - https://apidocs.lighter.xyz/docs/data-structures-constants-and-errors
-  - https://github.com/elliottech/lighter-python
+  - https://github.com/elliottech/lighter-python/blob/main/lighter/signer_client.py
   - https://github.com/elliottech/lighter-go
-
-Architecture:
-  1. Native Backend (when `lighter` SDK or `lighter_signer_{os}_{arch}` shared library is installed):
-     Uses the official C shared library (`CreateClient`, `SignCreateOrder`, `SignModifyOrder`,
-     `SignCancelOrder`, `SignCancelAllOrders`, `SignUpdateLeverage`, `CreateAuthToken`) with
-     Robinhood Lighter chain ID (`466324` on mainnet, `300` on testnet).
-  2. Pure-Python / Deterministic Signer Backend (fallback when C binary is not present or in dry-run/tests):
-     Constructs the exact Lighter L2 `tx_type` + `tx_info` JSON schema (`L2CreateOrderTxInfo`,
-     `L2ModifyOrderTxInfo`, `L2CancelOrderTxInfo`, `L2CancelAllOrdersTxInfo`, `L2UpdateLeverageTxInfo`)
-     and signs deterministically using Ed25519 / Poseidon-compatible digest so unit tests, simulations,
-     and full mirror inspection work out of the box without external binary dependencies.
 """
 from __future__ import annotations
 
@@ -39,21 +27,139 @@ from utils import canonical, fmt, to_int
 log = logging.getLogger("signer")
 
 
-class SignedTxOrError(ctypes.Structure):
+class SignedTxResponse(ctypes.Structure):
     _fields_ = [
         ("txType", ctypes.c_uint8),
-        ("txInfo", ctypes.c_char_p),
-        ("txHash", ctypes.c_char_p),
-        ("messageToSign", ctypes.c_char_p),
-        ("err", ctypes.c_char_p),
+        ("txInfo", ctypes.c_void_p),
+        ("txHash", ctypes.c_void_p),
+        ("messageToSign", ctypes.c_void_p),
+        ("err", ctypes.c_void_p),
     ]
 
 
 class StrOrErr(ctypes.Structure):
     _fields_ = [
-        ("str", ctypes.c_char_p),
-        ("err", ctypes.c_char_p),
+        ("str", ctypes.c_void_p),
+        ("err", ctypes.c_void_p),
     ]
+
+
+class ApiKeyResponse(ctypes.Structure):
+    _fields_ = [
+        ("privateKey", ctypes.c_void_p),
+        ("publicKey", ctypes.c_void_p),
+        ("err", ctypes.c_void_p),
+    ]
+
+
+def _decode_and_free(lib: Any, ptr: Any) -> Optional[str]:
+    if not ptr:
+        return None
+    if isinstance(ptr, bytes):
+        return ptr.decode("utf-8", errors="replace")
+    if isinstance(ptr, str):
+        return ptr
+    try:
+        c_str = ctypes.cast(ptr, ctypes.c_char_p).value
+        if c_str is not None:
+            return c_str.decode("utf-8", errors="replace")
+        return None
+    finally:
+        if lib is not None and hasattr(lib, "Free"):
+            try:
+                lib.Free(ptr)
+            except Exception:
+                pass
+
+
+def _populate_c_lib_signatures(lib: Any) -> None:
+    """Populate exact ctypes argtypes and restypes matching elliottech/lighter-python signer_client.py."""
+    lib.CreateClient.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_longlong
+    ]
+    lib.CreateClient.restype = ctypes.c_void_p
+
+    if hasattr(lib, "CheckClient"):
+        lib.CheckClient.argtypes = [ctypes.c_int, ctypes.c_longlong]
+        lib.CheckClient.restype = ctypes.c_void_p
+
+    # 19-argument SignCreateOrder (includes integrator fees & self-trade behavior modes)
+    lib.SignCreateOrder.argtypes = [
+        ctypes.c_int,       # market_index
+        ctypes.c_longlong,  # client_order_index
+        ctypes.c_longlong,  # base_amount
+        ctypes.c_int,       # price
+        ctypes.c_int,       # is_ask
+        ctypes.c_int,       # order_type
+        ctypes.c_int,       # time_in_force
+        ctypes.c_int,       # reduce_only
+        ctypes.c_int,       # trigger_price
+        ctypes.c_longlong,  # order_expiry
+        ctypes.c_longlong,  # integrator_account_index
+        ctypes.c_int,       # integrator_taker_fee
+        ctypes.c_int,       # integrator_maker_fee
+        ctypes.c_uint8,     # self_trade_behavior_mode
+        ctypes.c_uint8,     # self_trade_equality_mode
+        ctypes.c_uint8,     # skip_nonce
+        ctypes.c_longlong,  # nonce
+        ctypes.c_int,       # api_key_index
+        ctypes.c_longlong,  # account_index
+    ]
+    lib.SignCreateOrder.restype = SignedTxResponse
+
+    # 15-argument SignModifyOrder (includes integrator fees, self-trade modes & order_version)
+    lib.SignModifyOrder.argtypes = [
+        ctypes.c_int,       # market_index
+        ctypes.c_longlong,  # order_index
+        ctypes.c_longlong,  # base_amount
+        ctypes.c_longlong,  # price
+        ctypes.c_longlong,  # trigger_price
+        ctypes.c_longlong,  # integrator_account_index
+        ctypes.c_int,       # integrator_taker_fee
+        ctypes.c_int,       # integrator_maker_fee
+        ctypes.c_uint8,     # self_trade_behavior_mode
+        ctypes.c_uint8,     # self_trade_equality_mode
+        ctypes.c_uint8,     # skip_nonce
+        ctypes.c_longlong,  # nonce
+        ctypes.c_longlong,  # order_version
+        ctypes.c_int,       # api_key_index
+        ctypes.c_longlong,  # account_index
+    ]
+    lib.SignModifyOrder.restype = SignedTxResponse
+
+    # 6-argument SignCancelOrder
+    lib.SignCancelOrder.argtypes = [
+        ctypes.c_int,       # market_index
+        ctypes.c_longlong,  # order_index
+        ctypes.c_uint8,     # skip_nonce
+        ctypes.c_longlong,  # nonce
+        ctypes.c_int,       # api_key_index
+        ctypes.c_longlong,  # account_index
+    ]
+    lib.SignCancelOrder.restype = SignedTxResponse
+
+    # 7-argument SignCancelAllOrders
+    lib.SignCancelAllOrders.argtypes = [
+        ctypes.c_int,       # time_in_force
+        ctypes.c_longlong,  # timestamp_ms
+        ctypes.c_int,       # cancel_all_market_index
+        ctypes.c_uint8,     # skip_nonce
+        ctypes.c_longlong,  # nonce
+        ctypes.c_int,       # api_key_index
+        ctypes.c_longlong,  # account_index
+    ]
+    lib.SignCancelAllOrders.restype = SignedTxResponse
+
+    lib.CreateAuthToken.argtypes = [
+        ctypes.c_longlong,  # deadline_unix
+        ctypes.c_int,       # api_key_index
+        ctypes.c_longlong,  # account_index
+    ]
+    lib.CreateAuthToken.restype = StrOrErr
+
+    if hasattr(lib, "Free"):
+        lib.Free.argtypes = [ctypes.c_void_p]
+        lib.Free.restype = None
 
 
 class Signer:
@@ -84,10 +190,6 @@ class Signer:
     ORDER_TYPE_TWAP = 6
 
     # --- Lighter Official Time-In-Force Constants ---
-    # Per Lighter SDK (elliottech/lighter-python & apidocs.lighter.xyz/docs/trading):
-    #   ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0 (IOC)
-    #   ORDER_TIME_IN_FORCE_GOOD_TILL_TIME      = 1 (GTT / GTC)
-    #   ORDER_TIME_IN_FORCE_POST_ONLY           = 2 (ALO / POST_ONLY)
     LIGHTER_TIF_IOC = 0
     LIGHTER_TIF_GTT = 1
     LIGHTER_TIF_POST_ONLY = 2
@@ -98,7 +200,7 @@ class Signer:
     TIF_GTT, TIF_FOK, TIF_IOC, TIF_ALO = 0, 1, 2, 3
     TIF_GTC = TIF_GTT
 
-    # --- Lighter Official Cancel-All (Dead Man's Switch) TIF Constants ---
+    # --- Lighter Official Cancel-All (Dead Man Switch) TIF Constants ---
     CANCEL_ALL_TIF_IMMEDIATE = 0
     CANCEL_ALL_TIF_SCHEDULED = 1
     CANCEL_ALL_TIF_ABORT = 2
@@ -108,7 +210,8 @@ class Signer:
     DEFAULT_28_DAY_ORDER_EXPIRY = -1
     DEFAULT_IOC_EXPIRY = 0
     NIL_MARKET_INDEX = 255
-    TX_EXPIRY_OFFSET_MS = 10 * 60 * 1000 - 1000  # 9m59s ahead in ms per Lighter Go SDK
+    NIL_ORDER_VERSION = 0
+    TX_EXPIRY_OFFSET_MS = 10 * 60 * 1000 - 1000
 
     def __init__(
         self,
@@ -143,24 +246,47 @@ class Signer:
 
         self._last_ts = 0
         self._nonce: Optional[int] = None
-        # Client order index must be unique positive integer <= 2^48 - 1 (we keep within 1..2^31-1 for safe JSON/int32 compat)
         self._client_order_seq = int(time.time() * 1000) % 1_000_000_000
-        # Map client_order_index <-> venue order_index
         self.client_to_venue_id: dict[str, int] = {}
         self.venue_to_client_id: dict[str, str] = {}
 
-        # Optional native lighter-signer C library or lighter-sdk integration
         self._c_lib = None
-        self._sdk_signer = None
+        self._c_lib_path = ""
+        self.c_client_error: Optional[str] = None
         self._init_native_signer(signer_lib_path)
 
     def _init_native_signer(self, signer_lib_path: str = "") -> None:
-        """Attempt to load official lighter-signer shared library or lighter.SignerClient if installed."""
+        """Load official lighter-signer shared library (via lighter.signer_client or direct CDLL)."""
+        # 1. Try lighter.signer_client.get_signer() first so we share the exact SDK ctypes setup
+        if not signer_lib_path:
+            try:
+                import lighter.signer_client as lsc  # type: ignore
+                lib = lsc.get_signer()
+                if lib is not None:
+                    self._c_lib = lib
+                    self._c_lib_path = "lighter.signer_client.get_signer()"
+                    err_str = self.reinit_client(self.ai, self.api_key_index)
+                    if err_str is None:
+                        log.info(
+                            "Initialized native Lighter C signer via lighter.signer_client "
+                            "(chain_id=%d, account_index=%d, api_key_index=%d)",
+                            self.chain_id, self.ai, self.api_key_index,
+                        )
+                    else:
+                        log.warning(
+                            "Native Lighter C signer loaded, but CreateClient reported: %s "
+                            "(check LIGHTER_API_PRIVATE_KEY [80-hex / 40-byte key], LIGHTER_ACCOUNT_INDEX=%d, LIGHTER_API_KEY_INDEX=%d)",
+                            err_str, self.ai, self.api_key_index,
+                        )
+                    return
+            except Exception as e:
+                log.debug("lighter.signer_client.get_signer() not used directly: %s", e)
+
+        # 2. Fallback: locate shared library binary on disk
         candidates = []
         if signer_lib_path and os.path.exists(signer_lib_path):
             candidates.append(signer_lib_path)
 
-        # Check if `lighter` Python SDK is installed with bundled shared libraries
         try:
             import lighter  # type: ignore
             pkg_dir = os.path.dirname(lighter.__file__)
@@ -181,60 +307,89 @@ class Signer:
         for path in candidates:
             try:
                 lib = ctypes.CDLL(path)
-                lib.CreateClient.argtypes = [
-                    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.CreateClient.restype = ctypes.c_char_p
-
-                lib.SignCreateOrder.argtypes = [
-                    ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_int,
-                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                    ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.SignCreateOrder.restype = SignedTxOrError
-
-                lib.SignModifyOrder.argtypes = [
-                    ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_longlong,
-                    ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.SignModifyOrder.restype = SignedTxOrError
-
-                lib.SignCancelOrder.argtypes = [
-                    ctypes.c_int, ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong,
-                    ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.SignCancelOrder.restype = SignedTxOrError
-
-                lib.SignCancelAllOrders.argtypes = [
-                    ctypes.c_int, ctypes.c_longlong, ctypes.c_int, ctypes.c_int,
-                    ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.SignCancelAllOrders.restype = SignedTxOrError
-
-                lib.CreateAuthToken.argtypes = [
-                    ctypes.c_longlong, ctypes.c_int, ctypes.c_longlong
-                ]
-                lib.CreateAuthToken.restype = StrOrErr
-
-                err = lib.CreateClient(
-                    self.rest_url.encode("utf-8"),
-                    self.raw_key_hex.encode("utf-8"),
-                    ctypes.c_int(self.chain_id),
-                    ctypes.c_int(self.api_key_index),
-                    ctypes.c_longlong(self.ai),
-                )
-                if err is None:
-                    self._c_lib = lib
-                    log.info("Loaded native Lighter C signer library from %s (chain_id=%d)", path, self.chain_id)
-                    return
+                _populate_c_lib_signatures(lib)
+                self._c_lib = lib
+                self._c_lib_path = path
+                err_str = self.reinit_client(self.ai, self.api_key_index)
+                if err_str is None:
+                    log.info(
+                        "Loaded native Lighter C signer library from %s (chain_id=%d, account_index=%d, api_key_index=%d)",
+                        path, self.chain_id, self.ai, self.api_key_index,
+                    )
                 else:
-                    log.warning("Native Lighter C signer CreateClient returned error: %s", err.decode("utf-8", errors="ignore"))
+                    log.warning(
+                        "Loaded native Lighter C library from %s, but CreateClient reported: %s",
+                        path, err_str,
+                    )
+                return
             except Exception as e:
                 log.debug("Could not initialize native Lighter C library at %s: %s", path, e)
 
+    def reinit_client(
+        self,
+        account_index: Optional[int] = None,
+        api_key_index: Optional[int] = None,
+        rest_url: Optional[str] = None,
+        chain_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """(Re-)initialize the C signer client for `(account_index, api_key_index)`.
+        Returns `None` on success, or the error string from `CreateClient` on failure.
+        """
+        if account_index is not None:
+            self.ai = int(account_index)
+        if api_key_index is not None:
+            self.api_key_index = int(api_key_index)
+        if rest_url is not None:
+            self.rest_url = rest_url.rstrip("/")
+        if chain_id is not None:
+            self.chain_id = int(chain_id)
+
+        if self._c_lib is None:
+            return None
+        try:
+            err_ptr = self._c_lib.CreateClient(
+                self.rest_url.encode("utf-8"),
+                self.raw_key_hex.encode("utf-8"),
+                int(self.chain_id),
+                int(self.api_key_index),
+                int(self.ai),
+            )
+            err_str = _decode_and_free(self._c_lib, err_ptr)
+            self.c_client_error = err_str
+            return err_str
+        except Exception as e:
+            self.c_client_error = str(e)
+            return str(e)
+
+    def check_client(self) -> Optional[str]:
+        """Verify with the Lighter server that `(api_key_index, account_index)` matches `LIGHTER_API_PRIVATE_KEY`.
+        Returns `None` if valid, or an error string describing the mismatch.
+        """
+        if self._c_lib is None:
+            return None
+        if self.c_client_error:
+            return f"CreateClient failed: {self.c_client_error}"
+        if not hasattr(self._c_lib, "CheckClient"):
+            return None
+        try:
+            err_ptr = self._c_lib.CheckClient(int(self.api_key_index), int(self.ai))
+            return _decode_and_free(self._c_lib, err_ptr)
+        except Exception as e:
+            return str(e)
+
+    def _decode_signed_tx(self, res: Any) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+        """Decode a `SignedTxResponse` returned by the C library and free all C strings."""
+        err_str = _decode_and_free(self._c_lib, getattr(res, "err", None))
+        tx_info_str = _decode_and_free(self._c_lib, getattr(res, "txInfo", None))
+        tx_hash_str = _decode_and_free(self._c_lib, getattr(res, "txHash", None))
+        _decode_and_free(self._c_lib, getattr(res, "messageToSign", None))
+        if err_str:
+            return None, None, None, err_str
+        return int(res.txType), tx_info_str, tx_hash_str, None
+
     @property
     def uses_native_c_signer(self) -> bool:
-        return self._c_lib is not None
+        return self._c_lib is not None and self.c_client_error is None
 
     # ------------------------------------------------------------------
     # Nonce & ClientOrderIndex Management
@@ -248,7 +403,7 @@ class Signer:
         self._nonce = int(nonce)
 
     def next_nonce(self) -> int:
-        """Return and increment local nonce. Starts at 0 if not yet fetched from server."""
+        """Return and increment local nonce. If not yet synchronized, starts at 0."""
         if self._nonce is None:
             self._nonce = 0
         n = self._nonce
@@ -256,8 +411,10 @@ class Signer:
         return n
 
     def rollback_nonce(self) -> None:
-        """Roll back local optimistic nonce by 1 when a network send fails before reaching sequencer."""
-        if self._nonce is not None and self._nonce > 0:
+        """Roll back local optimistic nonce by 1 (or reset to None for C signer hard-refresh) on error."""
+        if self.uses_native_c_signer:
+            self._nonce = None
+        elif self._nonce is not None and self._nonce > 0:
             self._nonce -= 1
 
     def next_client_order_index(self) -> int:
@@ -287,32 +444,34 @@ class Signer:
         try:
             return int(s)
         except ValueError:
-            # Hash string order IDs into positive 31-bit integer for test fixtures like "oid-1"
             return (int(hashlib.sha256(s.encode("utf-8")).hexdigest()[:8], 16) & 0x7FFFFFFF) or 1
 
     # ------------------------------------------------------------------
     # Auth Token Generation (HTTP & WebSocket private channels)
     # ------------------------------------------------------------------
     def create_auth_token(self, expiry_seconds: int = 25200, now_unix: Optional[int] = None) -> str:
-        """Generate a Lighter auth token valid for up to 8 hours (default 7 hours = 25,200s).
-        Format: `{deadline_unix}:{account_index}:{api_key_index}:{signature_hex}`
-        """
+        """Generate a Lighter auth token valid for up to 8 hours (default 7 hours = 25,200s)."""
         now_s = int(time.time()) if now_unix is None else int(now_unix)
-        # Lighter max accepted deadline is 8 hours (28,800s); clamp to [60s, 28500s]
         expiry_seconds = max(60, min(28500, int(expiry_seconds)))
         deadline = now_s + expiry_seconds
 
-        if self._c_lib is not None:
-            res = self._c_lib.CreateAuthToken(
-                ctypes.c_longlong(deadline),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.str:
-                return res.str.decode("utf-8")
+        if self._c_lib is not None and self.c_client_error is None:
+            try:
+                res = self._c_lib.CreateAuthToken(
+                    int(deadline),
+                    int(self.api_key_index),
+                    int(self.ai),
+                )
+                auth_str = _decode_and_free(self._c_lib, getattr(res, "str", None))
+                err_str = _decode_and_free(self._c_lib, getattr(res, "err", None))
+                if not err_str and auth_str:
+                    return auth_str
+                if err_str:
+                    log.warning("CreateAuthToken C error: %s", err_str)
+            except Exception as e:
+                log.warning("CreateAuthToken exception: %s", e)
 
         msg = f"{deadline}:{self.ai}:{self.api_key_index}"
-        # Sign with Ed25519 + chain_id domain separation (80-byte / 160-hex Schnorr signature format)
         sig_64 = self.priv.sign(f"{self.chain_id}:{msg}".encode("utf-8"))
         digest_16 = hmac.new(self.raw_key_hex.encode("utf-8"), sig_64, hashlib.sha256).digest()[:16]
         sig_hex = (sig_64 + digest_16).hex()
@@ -327,7 +486,7 @@ class Signer:
         return canonical(d)
 
     def _sign_l2_tx_info(self, tx_type: int, tx_info_dict: dict) -> Tuple[str, str]:
-        """Compute deterministic L2 signature (base64 `Sig`) and `tx_hash` for pure-Python mode."""
+        """Compute deterministic L2 signature (base64 `Sig`) and `tx_hash` for pure-Python test/sim mode."""
         canonical_payload = canonical({"chainId": self.chain_id, "txType": tx_type, **tx_info_dict})
         sig_64 = self.priv.sign(canonical_payload.encode("utf-8"))
         extra_16 = hmac.new(self.raw_key_hex.encode("utf-8"), sig_64, hashlib.sha256).digest()[:16]
@@ -346,6 +505,7 @@ class Signer:
         tx_info: Optional[str] = None,
         tx_hash: Optional[str] = None,
         client_order_index: Optional[int] = None,
+        signer_error: Optional[str] = None,
     ) -> dict:
         env = {
             "type": req_type,
@@ -362,6 +522,8 @@ class Signer:
             env["tx_hash"] = tx_hash
         if client_order_index is not None:
             env["client_order_index"] = int(client_order_index)
+        if signer_error is not None:
+            env["signer_error"] = signer_error
         return env
 
     @staticmethod
@@ -371,7 +533,6 @@ class Signer:
             return Signer.LIGHTER_TIF_IOC
         if tif in ("GTT", "GTC"):
             return Signer.LIGHTER_TIF_GTT
-        # Default maker order is POST_ONLY (ALO = 2)
         return Signer.LIGHTER_TIF_POST_ONLY
 
     @staticmethod
@@ -416,11 +577,9 @@ class Signer:
         int_price = self._scale_price(m, px)
         int_size = self._scale_size(m, qty)
         coi = int(client_order_index) if client_order_index is not None else self.next_client_order_index()
+        was_unsynced = (nonce is None and self._nonce is None)
         tx_nonce = int(nonce) if nonce is not None else self.next_nonce()
 
-        # Lighter OrderExpiry rule:
-        #   - IOC orders MUST have OrderExpiry = 0 (passing non-zero triggers error 21711 invalid expiry!)
-        #   - Resting GTT / POST_ONLY orders take Unix milliseconds (clamped to <= 28 days for Lighter validator)
         if lighter_tif == self.LIGHTER_TIF_IOC:
             order_expiry_ms = self.DEFAULT_IOC_EXPIRY
         else:
@@ -434,27 +593,74 @@ class Signer:
 
         tx_info_str: Optional[str] = None
         tx_hash_str: Optional[str] = None
+        signer_error: Optional[str] = None
 
         if self._c_lib is not None:
-            res = self._c_lib.SignCreateOrder(
-                ctypes.c_int(m.market_id),
-                ctypes.c_longlong(coi),
-                ctypes.c_longlong(int_size),
-                ctypes.c_int(int_price),
-                ctypes.c_int(is_ask),
-                ctypes.c_int(self.ORDER_TYPE_LIMIT),
-                ctypes.c_int(lighter_tif),
-                ctypes.c_int(r_val),
-                ctypes.c_int(self.NIL_TRIGGER_PRICE),
-                ctypes.c_longlong(order_expiry_ms),
-                ctypes.c_int(self.skip_nonce),
-                ctypes.c_longlong(tx_nonce),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.txInfo:
-                tx_info_str = res.txInfo.decode("utf-8")
-                tx_hash_str = res.txHash.decode("utf-8") if res.txHash else None
+            if self.c_client_error:
+                signer_error = f"Lighter C Signer CreateClient failed: {self.c_client_error}"
+            else:
+                try:
+                    c_expiry = (
+                        self.DEFAULT_IOC_EXPIRY
+                        if lighter_tif == self.LIGHTER_TIF_IOC
+                        else self.DEFAULT_28_DAY_ORDER_EXPIRY
+                    )
+                    c_nonce = -1 if was_unsynced else tx_nonce
+                    n_args = len(getattr(self._c_lib.SignCreateOrder, "argtypes", None) or [])
+                    if n_args == 14:
+                        res = self._c_lib.SignCreateOrder(
+                            int(m.market_id),
+                            int(coi),
+                            int(int_size),
+                            int(int_price),
+                            int(is_ask),
+                            int(self.ORDER_TYPE_LIMIT),
+                            int(lighter_tif),
+                            int(r_val),
+                            int(self.NIL_TRIGGER_PRICE),
+                            int(c_expiry),
+                            int(self.skip_nonce),
+                            int(c_nonce),
+                            int(self.api_key_index),
+                            int(self.ai),
+                        )
+                    else:
+                        # Official 19-argument SignCreateOrder in lighter-python / lighter-go
+                        res = self._c_lib.SignCreateOrder(
+                            int(m.market_id),
+                            int(coi),
+                            int(int_size),
+                            int(int_price),
+                            int(is_ask),
+                            int(self.ORDER_TYPE_LIMIT),
+                            int(lighter_tif),
+                            int(r_val),
+                            int(self.NIL_TRIGGER_PRICE),
+                            int(c_expiry),
+                            0,  # integrator_account_index
+                            0,  # integrator_taker_fee
+                            0,  # integrator_maker_fee
+                            0,  # self_trade_behavior_mode
+                            0,  # self_trade_equality_mode
+                            int(self.skip_nonce),
+                            int(c_nonce),
+                            int(self.api_key_index),
+                            int(self.ai),
+                        )
+                    _, tx_info_str, tx_hash_str, c_err = self._decode_signed_tx(res)
+                    if c_err:
+                        signer_error = f"SignCreateOrder error: {c_err}"
+                        log.error("Lighter C SignCreateOrder failed: %s", c_err)
+                    elif tx_info_str:
+                        try:
+                            parsed_n = json.loads(tx_info_str).get("Nonce")
+                            if parsed_n is not None:
+                                self._nonce = int(parsed_n) + 1
+                        except Exception:
+                            pass
+                except Exception as e:
+                    signer_error = f"SignCreateOrder exception: {e}"
+                    log.error("Lighter C SignCreateOrder exception: %s", e)
 
         if tx_info_str is None:
             tx_info_obj: dict[str, Any] = {
@@ -515,29 +721,41 @@ class Signer:
             tx_info=tx_info_str,
             tx_hash=tx_hash_str,
             client_order_index=coi,
+            signer_error=signer_error,
         )
 
     def cancel(self, m: Market, order_id: str, nonce: Optional[int] = None) -> dict:
         ts = self.next_ts()
         idx = self.resolve_order_index(order_id)
+        was_unsynced = (nonce is None and self._nonce is None)
         tx_nonce = int(nonce) if nonce is not None else self.next_nonce()
+        c_nonce = -1 if was_unsynced else tx_nonce
         expired_at_ms = int(time.time() * 1000) + self.TX_EXPIRY_OFFSET_MS
 
         tx_info_str: Optional[str] = None
         tx_hash_str: Optional[str] = None
+        signer_error: Optional[str] = None
 
         if self._c_lib is not None:
-            res = self._c_lib.SignCancelOrder(
-                ctypes.c_int(m.market_id),
-                ctypes.c_longlong(idx),
-                ctypes.c_int(self.skip_nonce),
-                ctypes.c_longlong(tx_nonce),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.txInfo:
-                tx_info_str = res.txInfo.decode("utf-8")
-                tx_hash_str = res.txHash.decode("utf-8") if res.txHash else None
+            if self.c_client_error:
+                signer_error = f"Lighter C Signer CreateClient failed: {self.c_client_error}"
+            else:
+                try:
+                    res = self._c_lib.SignCancelOrder(
+                        int(m.market_id),
+                        int(idx),
+                        int(self.skip_nonce),
+                        int(c_nonce),
+                        int(self.api_key_index),
+                        int(self.ai),
+                    )
+                    _, tx_info_str, tx_hash_str, c_err = self._decode_signed_tx(res)
+                    if c_err:
+                        signer_error = f"SignCancelOrder error: {c_err}"
+                        log.error("Lighter C SignCancelOrder failed: %s", c_err)
+                except Exception as e:
+                    signer_error = f"SignCancelOrder exception: {e}"
+                    log.error("Lighter C SignCancelOrder exception: %s", e)
 
         if tx_info_str is None:
             tx_info_obj: dict[str, Any] = {
@@ -574,6 +792,7 @@ class Signer:
             tx_type=self.TX_TYPE_CANCEL_ORDER,
             tx_info=tx_info_str,
             tx_hash=tx_hash_str,
+            signer_error=signer_error,
         )
 
     def modify(
@@ -593,27 +812,59 @@ class Signer:
         int_price = self._scale_price(m, px)
         int_size = self._scale_size(m, qty)
         idx = self.resolve_order_index(order_id)
+        was_unsynced = (nonce is None and self._nonce is None)
         tx_nonce = int(nonce) if nonce is not None else self.next_nonce()
+        c_nonce = -1 if was_unsynced else tx_nonce
         expired_at_ms = int(time.time() * 1000) + self.TX_EXPIRY_OFFSET_MS
 
         tx_info_str: Optional[str] = None
         tx_hash_str: Optional[str] = None
+        signer_error: Optional[str] = None
 
         if self._c_lib is not None:
-            res = self._c_lib.SignModifyOrder(
-                ctypes.c_int(m.market_id),
-                ctypes.c_longlong(idx),
-                ctypes.c_longlong(int_size),
-                ctypes.c_longlong(int_price),
-                ctypes.c_longlong(self.NIL_TRIGGER_PRICE),
-                ctypes.c_int(self.skip_nonce),
-                ctypes.c_longlong(tx_nonce),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.txInfo:
-                tx_info_str = res.txInfo.decode("utf-8")
-                tx_hash_str = res.txHash.decode("utf-8") if res.txHash else None
+            if self.c_client_error:
+                signer_error = f"Lighter C Signer CreateClient failed: {self.c_client_error}"
+            else:
+                try:
+                    n_args = len(getattr(self._c_lib.SignModifyOrder, "argtypes", None) or [])
+                    if n_args == 9:
+                        res = self._c_lib.SignModifyOrder(
+                            int(m.market_id),
+                            int(idx),
+                            int(int_size),
+                            int(int_price),
+                            int(self.NIL_TRIGGER_PRICE),
+                            int(self.skip_nonce),
+                            int(tx_nonce),
+                            int(self.api_key_index),
+                            int(self.ai),
+                        )
+                    else:
+                        # Official 15-argument SignModifyOrder in lighter-python / lighter-go
+                        res = self._c_lib.SignModifyOrder(
+                            int(m.market_id),
+                            int(idx),
+                            int(int_size),
+                            int(int_price),
+                            int(self.NIL_TRIGGER_PRICE),
+                            0,  # integrator_account_index
+                            0,  # integrator_taker_fee
+                            0,  # integrator_maker_fee
+                            0,  # self_trade_behavior_mode
+                            0,  # self_trade_equality_mode
+                            int(self.skip_nonce),
+                            int(c_nonce),
+                            int(self.NIL_ORDER_VERSION),
+                            int(self.api_key_index),
+                            int(self.ai),
+                        )
+                    _, tx_info_str, tx_hash_str, c_err = self._decode_signed_tx(res)
+                    if c_err:
+                        signer_error = f"SignModifyOrder error: {c_err}"
+                        log.error("Lighter C SignModifyOrder failed: %s", c_err)
+                except Exception as e:
+                    signer_error = f"SignModifyOrder exception: {e}"
+                    log.error("Lighter C SignModifyOrder exception: %s", e)
 
         if tx_info_str is None:
             tx_info_obj: dict[str, Any] = {
@@ -664,6 +915,7 @@ class Signer:
             tx_type=self.TX_TYPE_MODIFY_ORDER,
             tx_info=tx_info_str,
             tx_hash=tx_hash_str,
+            signer_error=signer_error,
         )
 
     def schedule_cancel(
@@ -672,11 +924,7 @@ class Signer:
         deadline_us: "int | None",
         nonce: Optional[int] = None,
     ) -> dict:
-        """Dead man's switch via Lighter `SignCancelAllOrders` (TxType 16).
-        - deadline_us = absolute epoch microseconds (5s-5min ahead) -> CANCEL_ALL_TIF_SCHEDULED (1) with Time in ms.
-        - deadline_us = None -> CANCEL_ALL_TIF_ABORT (2) with Time = 0 to disarm.
-        Scoped to `m.market_id` (or `NIL_MARKET_INDEX = 255` for account-wide).
-        """
+        """Dead man switch via Lighter `SignCancelAllOrders` (TxType 16)."""
         ts = self.next_ts()
         tx_nonce = int(nonce) if nonce is not None else self.next_nonce()
         expired_at_ms = int(time.time() * 1000) + self.TX_EXPIRY_OFFSET_MS
@@ -691,20 +939,29 @@ class Signer:
         market_idx = int(m.market_id) if m is not None else self.NIL_MARKET_INDEX
         tx_info_str: Optional[str] = None
         tx_hash_str: Optional[str] = None
+        signer_error: Optional[str] = None
 
         if self._c_lib is not None:
-            res = self._c_lib.SignCancelAllOrders(
-                ctypes.c_int(cancel_tif),
-                ctypes.c_longlong(time_ms),
-                ctypes.c_int(market_idx),
-                ctypes.c_int(self.skip_nonce),
-                ctypes.c_longlong(tx_nonce),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.txInfo:
-                tx_info_str = res.txInfo.decode("utf-8")
-                tx_hash_str = res.txHash.decode("utf-8") if res.txHash else None
+            if self.c_client_error:
+                signer_error = f"Lighter C Signer CreateClient failed: {self.c_client_error}"
+            else:
+                try:
+                    res = self._c_lib.SignCancelAllOrders(
+                        int(cancel_tif),
+                        int(time_ms),
+                        int(market_idx),
+                        int(self.skip_nonce),
+                        int(tx_nonce),
+                        int(self.api_key_index),
+                        int(self.ai),
+                    )
+                    _, tx_info_str, tx_hash_str, c_err = self._decode_signed_tx(res)
+                    if c_err:
+                        signer_error = f"SignCancelAllOrders error: {c_err}"
+                        log.error("Lighter C SignCancelAllOrders failed: %s", c_err)
+                except Exception as e:
+                    signer_error = f"SignCancelAllOrders exception: {e}"
+                    log.error("Lighter C SignCancelAllOrders exception: %s", e)
 
         if tx_info_str is None:
             tx_info_obj: dict[str, Any] = {
@@ -739,6 +996,7 @@ class Signer:
             tx_type=self.TX_TYPE_CANCEL_ALL_ORDERS,
             tx_info=tx_info_str,
             tx_hash=tx_hash_str,
+            signer_error=signer_error,
         )
 
     def cancel_all_immediate(self, m: Optional[Market] = None, nonce: Optional[int] = None) -> dict:
@@ -750,20 +1008,29 @@ class Signer:
 
         tx_info_str: Optional[str] = None
         tx_hash_str: Optional[str] = None
+        signer_error: Optional[str] = None
 
         if self._c_lib is not None:
-            res = self._c_lib.SignCancelAllOrders(
-                ctypes.c_int(self.CANCEL_ALL_TIF_IMMEDIATE),
-                ctypes.c_longlong(0),
-                ctypes.c_int(market_idx),
-                ctypes.c_int(self.skip_nonce),
-                ctypes.c_longlong(tx_nonce),
-                ctypes.c_int(self.api_key_index),
-                ctypes.c_longlong(self.ai),
-            )
-            if not res.err and res.txInfo:
-                tx_info_str = res.txInfo.decode("utf-8")
-                tx_hash_str = res.txHash.decode("utf-8") if res.txHash else None
+            if self.c_client_error:
+                signer_error = f"Lighter C Signer CreateClient failed: {self.c_client_error}"
+            else:
+                try:
+                    res = self._c_lib.SignCancelAllOrders(
+                        int(self.CANCEL_ALL_TIF_IMMEDIATE),
+                        0,
+                        int(market_idx),
+                        int(self.skip_nonce),
+                        int(tx_nonce),
+                        int(self.api_key_index),
+                        int(self.ai),
+                    )
+                    _, tx_info_str, tx_hash_str, c_err = self._decode_signed_tx(res)
+                    if c_err:
+                        signer_error = f"SignCancelAllOrders error: {c_err}"
+                        log.error("Lighter C SignCancelAllOrders failed: %s", c_err)
+                except Exception as e:
+                    signer_error = f"SignCancelAllOrders exception: {e}"
+                    log.error("Lighter C SignCancelAllOrders exception: %s", e)
 
         if tx_info_str is None:
             tx_info_obj: dict[str, Any] = {
@@ -799,6 +1066,7 @@ class Signer:
             tx_type=self.TX_TYPE_CANCEL_ALL_ORDERS,
             tx_info=tx_info_str,
             tx_hash=tx_hash_str,
+            signer_error=signer_error,
         )
 
     def legacy(self, action: str, body: dict) -> dict:

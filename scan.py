@@ -28,7 +28,7 @@ async def scan(cfg: Config, seconds: float = 30.0) -> None:
     by_id: dict[int, dict] = {m.market_id: {"spread": [], "mid": [], "n": 0, "m": m} for m in online}
     by_name: dict[str, dict] = {m.name: by_id[m.market_id] for m in online}
 
-    async with websockets.connect(ws_url, ping_interval=15, max_size=2 ** 23) as ws:
+    async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None, max_size=2 ** 23) as ws:
         for m in online:
             # Subscribe to Lighter ticker/{market_id} and order_book/{market_id}
             await ws.send(json.dumps({"type": "subscribe", "channel": f"ticker/{m.market_id}"}))

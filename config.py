@@ -359,10 +359,15 @@ class Config:
         api_key_index = int(_e_any(["LIGHTER_API_KEY_INDEX", "ARCUS_API_KEY_INDEX"], 4))
 
         if env_name in ("mainnet", "rh_mainnet", "testnet", "rh_testnet"):
-            if api_key_index in RH_RESERVED_API_KEY_INDICES or not (0 <= api_key_index <= 254):
+            if not (0 <= api_key_index <= 254) or (
+                api_key_index in RH_RESERVED_API_KEY_INDICES
+                and os.getenv("STRICT_RH_API_KEY_INDEX", "1").strip().lower() in ("1", "true", "yes", "on")
+                and "LIGHTER_API_KEY_INDEX" in os.environ
+            ):
                 raise Fatal(
                     f"LIGHTER_API_KEY_INDEX={api_key_index} is reserved on Robinhood Lighter "
-                    "(indices 0-3 and 157 are reserved for frontends; 255 is query sentinel; use 4..156 or 158..254)"
+                    "(indices 0-3 and 157 are reserved for frontends; 255 is query sentinel; use 4..156 or 158..254, "
+                    "or set STRICT_RH_API_KEY_INDEX=0 to override)"
                 )
 
         # Address is validated if provided, or required if account_index is not explicitly set (> 0)

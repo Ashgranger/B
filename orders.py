@@ -65,6 +65,7 @@ class OrderManager:
         self.maybe_orders = True
         self.on_reduce_only_rejected = None
         self.n_place = self.n_modify = self.n_cancel = self.n_reject = self.n_actions = 0
+        self._tx_lock = asyncio.Lock()
 
     def side_orders(self, side: str) -> list[Order]:
         return sorted((o for o in self.orders.values() if o.side == side), key=lambda o: o.price, reverse=(side == BUY))
@@ -123,6 +124,20 @@ class OrderManager:
                 except RuntimeError:
                     pass
             self.paused_until = max(self.paused_until, now + 1.5)
+        elif code in (21120, 21136):
+            log.error(
+                "INVALID SIGNATURE / PUBLIC KEY (code %s) - resyncing account_index, api_key_index, and nonce with server",
+                code,
+            )
+            if hasattr(self.signer, "rollback_nonce"):
+                self.signer.rollback_nonce()
+            if hasattr(self.ex, "verify_and_sync_credentials"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.ex.verify_and_sync_credentials())
+                except RuntimeError:
+                    pass
+            self.paused_until = max(self.paused_until, now + 5.0)
         elif code == 21732 or (isinstance(err, dict) and "REDUCE_ONLY" in str(err.get("message", "")).upper()):
             log.warning("REDUCE_ONLY REJECTED (code %s) - triggering position reconciliation", code)
             if hasattr(self, "on_reduce_only_rejected") and callable(self.on_reduce_only_rejected):
@@ -162,11 +177,18 @@ class OrderManager:
         if qty < m.min_size or (m.min_notional > 0 and px * qty < m.min_notional):
             return None
         good_til = int(time.time() * 1_000_000) + GTT_DAYS * 86_400 * 1_000_000
-        req = self.signer.place(m, side, px, qty, good_til,
-                                time_in_force=time_in_force, reduce_only=reduce_only)
         self.maybe_orders = True
         self.last_place_ts = now
-        resp = await self.ex.write(req)
+        use_lock = not self.cfg.dry_run and getattr(self.ex, "ws", None) is not None and hasattr(self.ex.ws, "transport")
+        if use_lock:
+            async with self._tx_lock:
+                req = self.signer.place(m, side, px, qty, good_til,
+                                        time_in_force=time_in_force, reduce_only=reduce_only)
+                resp = await self.ex.write(req)
+        else:
+            req = self.signer.place(m, side, px, qty, good_til,
+                                    time_in_force=time_in_force, reduce_only=reduce_only)
+            resp = await self.ex.write(req)
         res = resp.get("result") or {}
         if not self._ok(resp) or not res.get("orderId") or str(res.get("status")).upper() == "REJECTED":
             self._error(f"place L{pair_index} {side}", resp if not self._ok(resp) else
@@ -221,8 +243,14 @@ class OrderManager:
         r_only = o.is_reduce_only if reduce_only is None else reduce_only
         if px == o.price and r_only == o.is_reduce_only:
             return True
-        req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
-        resp = await self.ex.write(req)
+        use_lock = not self.cfg.dry_run and getattr(self.ex, "ws", None) is not None and hasattr(self.ex.ws, "transport")
+        if use_lock:
+            async with self._tx_lock:
+                req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
+                resp = await self.ex.write(req)
+        else:
+            req = self.signer.modify(m, o.order_id, o.side, px, o.qty, o.good_til_us, reduce_only=r_only)
+            resp = await self.ex.write(req)
         if not self._ok(resp):
             self._error(f"modify L{o.pair_index} {o.side}", resp, now)
             err = resp.get("error")
@@ -250,7 +278,12 @@ class OrderManager:
         o.cancelling_since = now
         self._recently_closed.append((now, o.order_id))
         self._budget(now)
-        resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
+        use_lock = not self.cfg.dry_run and getattr(self.ex, "ws", None) is not None and hasattr(self.ex.ws, "transport")
+        if use_lock:
+            async with self._tx_lock:
+                resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
+        else:
+            resp = await self.ex.write(self.signer.cancel(self.get_market(), o.order_id))
         if self.cfg.dry_run or "ORDER_NOT_FOUND" in json.dumps(resp):
             self._remove_order(o.order_id)
         elif not self._ok(resp):

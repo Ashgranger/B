@@ -359,5 +359,226 @@ class TestRobinhoodLighterPerpDex(unittest.IsolatedAsyncioTestCase):
         print("✓ test_06_lighter_ws_channels_and_live_order_lifecycle passed.")
 
 
+
+    async def test_07_c_shared_library_19_arg_abi_and_credential_sync(self):
+        """Compile a real C shared library matching lighter-signer-linux-amd64.so ABI (19-arg SignCreateOrder, 15-arg SignModifyOrder) and verify exact stack/register arguments."""
+        import subprocess, tempfile
+        c_src = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    uint8_t txType;
+    void* txInfo;
+    void* txHash;
+    void* messageToSign;
+    void* err;
+} SignedTxResponse;
+
+typedef struct {
+    void* str;
+    void* err;
+} StrOrErr;
+
+static int g_chain_id = 0;
+static int g_api_key_index = -1;
+static long long g_account_index = -1;
+
+void Free(void* ptr) {
+    if (ptr) free(ptr);
+}
+
+void* CreateClient(const char* url, const char* priv_key, int chain_id, int api_key_index, long long account_index) {
+    g_chain_id = chain_id;
+    g_api_key_index = api_key_index;
+    g_account_index = account_index;
+    return NULL;
+}
+
+void* CheckClient(int api_key_index, long long account_index) {
+    if (api_key_index != g_api_key_index || account_index != g_account_index) {
+        return strdup("client mismatch");
+    }
+    return NULL;
+}
+
+SignedTxResponse SignCreateOrder(
+    int market_index,
+    long long client_order_index,
+    long long base_amount,
+    int price,
+    int is_ask,
+    int order_type,
+    int time_in_force,
+    int reduce_only,
+    int trigger_price,
+    long long order_expiry,
+    long long integrator_account_index,
+    int integrator_taker_fee,
+    int integrator_maker_fee,
+    uint8_t self_trade_behavior_mode,
+    uint8_t self_trade_equality_mode,
+    uint8_t skip_nonce,
+    long long nonce,
+    int api_key_index,
+    long long account_index
+) {
+    SignedTxResponse r = {14, NULL, NULL, NULL, NULL};
+    if (api_key_index != g_api_key_index || account_index != g_account_index) {
+        r.err = strdup("client is not created, call CreateClient first");
+        return r;
+    }
+    char buf[512];
+    long long eff_nonce = (nonce == -1) ? 777 : nonce;
+    snprintf(buf, sizeof(buf),
+        "{\"AccountIndex\":%lld,\"ApiKeyIndex\":%d,\"MarketIndex\":%d,\"ClientOrderIndex\":%lld,"
+        "\"BaseAmount\":%lld,\"Price\":%d,\"IsAsk\":%d,\"Type\":%d,\"TimeInForce\":%d,"
+        "\"ReduceOnly\":%d,\"TriggerPrice\":%d,\"OrderExpiry\":%lld,\"Nonce\":%lld,\"Sig\":\"REAL_C_SCHNORR_SIG\"}",
+        account_index, api_key_index, market_index, client_order_index,
+        base_amount, price, is_ask, order_type, time_in_force,
+        reduce_only, trigger_price, order_expiry, eff_nonce);
+    r.txInfo = strdup(buf);
+    r.txHash = strdup("0xc_tx_hash_create");
+    return r;
+}
+
+SignedTxResponse SignModifyOrder(
+    int market_index,
+    long long order_index,
+    long long base_amount,
+    long long price,
+    long long trigger_price,
+    long long integrator_account_index,
+    int integrator_taker_fee,
+    int integrator_maker_fee,
+    uint8_t self_trade_behavior_mode,
+    uint8_t self_trade_equality_mode,
+    uint8_t skip_nonce,
+    long long nonce,
+    long long order_version,
+    int api_key_index,
+    long long account_index
+) {
+    SignedTxResponse r = {17, NULL, NULL, NULL, NULL};
+    if (api_key_index != g_api_key_index || account_index != g_account_index) {
+        r.err = strdup("client is not created, call CreateClient first");
+        return r;
+    }
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"AccountIndex\":%lld,\"ApiKeyIndex\":%d,\"MarketIndex\":%d,\"Index\":%lld,"
+        "\"BaseAmount\":%lld,\"Price\":%lld,\"Nonce\":%lld,\"Sig\":\"REAL_C_MOD_SIG\"}",
+        account_index, api_key_index, market_index, order_index, base_amount, price, nonce);
+    r.txInfo = strdup(buf);
+    r.txHash = strdup("0xc_tx_hash_mod");
+    return r;
+}
+
+SignedTxResponse SignCancelOrder(
+    int market_index,
+    long long order_index,
+    uint8_t skip_nonce,
+    long long nonce,
+    int api_key_index,
+    long long account_index
+) {
+    SignedTxResponse r = {15, NULL, NULL, NULL, NULL};
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"AccountIndex\":%lld,\"ApiKeyIndex\":%d,\"MarketIndex\":%d,\"Index\":%lld,\"Nonce\":%lld,\"Sig\":\"REAL_C_CAN_SIG\"}",
+        account_index, api_key_index, market_index, order_index, nonce);
+    r.txInfo = strdup(buf);
+    r.txHash = strdup("0xc_tx_hash_can");
+    return r;
+}
+
+SignedTxResponse SignCancelAllOrders(
+    int time_in_force,
+    long long timestamp_ms,
+    int cancel_all_market_index,
+    uint8_t skip_nonce,
+    long long nonce,
+    int api_key_index,
+    long long account_index
+) {
+    SignedTxResponse r = {16, NULL, NULL, NULL, NULL};
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"AccountIndex\":%lld,\"ApiKeyIndex\":%d,\"TimeInForce\":%d,\"Time\":%lld,\"MarketIndex\":%d,\"Nonce\":%lld,\"Sig\":\"REAL_C_DMS_SIG\"}",
+        account_index, api_key_index, time_in_force, timestamp_ms, cancel_all_market_index, nonce);
+    r.txInfo = strdup(buf);
+    r.txHash = strdup("0xc_tx_hash_dms");
+    return r;
+}
+
+StrOrErr CreateAuthToken(long long deadline, int api_key_index, long long account_index) {
+    StrOrErr r = {NULL, NULL};
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%lld:%lld:%d:c_auth_sig", deadline, account_index, api_key_index);
+    r.str = strdup(buf);
+    return r;
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpd:
+            c_path = os.path.join(tmpd, "mock_signer.c")
+            so_path = os.path.join(tmpd, "mock_signer.so")
+            with open(c_path, "w") as f:
+                f.write(c_src)
+            subprocess.check_call(["gcc", "-shared", "-fPIC", "-O2", c_path, "-o", so_path])
+
+            signer = Signer(
+                "a" * 80,
+                "0x1111111111111111111111111111111111111111",
+                account_index=42,
+                api_key_index=4,
+                chain_id=466324,
+                rest_url="https://api.rh.lighter.xyz",
+                signer_lib_path=so_path,
+            )
+            self.assertTrue(signer.uses_native_c_signer)
+            self.assertIsNone(signer.check_client())
+
+            m_nvda = Market.from_api({
+                "market_id": 15, "symbol": "NVDA", "status": "active",
+                "price_decimals": 2, "size_decimals": 4,
+                "min_base_amount": "0.0001", "min_quote_amount": "10.000000", "mark_price": "217.06",
+            })
+
+            # Place order without pre-setting nonce -> C library receives c_nonce=-1, returns Nonce=777, and signer syncs _nonce=778!
+            req_place = signer.place(m_nvda, BUY, Decimal("217.05"), Decimal("0.0507"), int((time.time() + 3600) * 1e6), time_in_force="ALO")
+            self.assertIsNone(req_place.get("signer_error"))
+            tx_info = json.loads(req_place["tx_info"])
+            self.assertEqual(tx_info["Sig"], "REAL_C_SCHNORR_SIG")
+            self.assertEqual(tx_info["AccountIndex"], 42)
+            self.assertEqual(tx_info["ApiKeyIndex"], 4)
+            self.assertEqual(tx_info["MarketIndex"], 15)
+            self.assertEqual(tx_info["Price"], 21705)
+            self.assertEqual(tx_info["BaseAmount"], 507)
+            self.assertEqual(tx_info["OrderExpiry"], -1)
+            self.assertEqual(tx_info["Nonce"], 777)
+            self.assertEqual(signer._nonce, 778)
+
+            # Modify order -> uses 15-arg C SignModifyOrder and synced nonce 778
+            req_mod = signer.modify(m_nvda, str(req_place["client_order_index"]), BUY, Decimal("217.04"), Decimal("0.0507"), int((time.time() + 3600) * 1e6))
+            self.assertIsNone(req_mod.get("signer_error"))
+            tx_mod = json.loads(req_mod["tx_info"])
+            self.assertEqual(tx_mod["Sig"], "REAL_C_MOD_SIG")
+            self.assertEqual(tx_mod["Nonce"], 778)
+
+            # Cancel order -> uses 6-arg C SignCancelOrder and nonce 779
+            req_can = signer.cancel(m_nvda, str(req_place["client_order_index"]))
+            self.assertIsNone(req_can.get("signer_error"))
+            tx_can = json.loads(req_can["tx_info"])
+            self.assertEqual(tx_can["Sig"], "REAL_C_CAN_SIG")
+            self.assertEqual(tx_can["Nonce"], 779)
+
+            # Auth token -> uses C CreateAuthToken
+            tok = signer.create_auth_token(expiry_seconds=600, now_unix=1760000000)
+            self.assertEqual(tok, "1760000600:42:4:c_auth_sig")
+        print("✓ test_07_c_shared_library_19_arg_abi_and_credential_sync passed.")
+
+
 if __name__ == "__main__":
     unittest.main()
